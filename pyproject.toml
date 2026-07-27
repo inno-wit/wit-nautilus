@@ -8,17 +8,26 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# nautilus_trader==1.230.0 confirmed installable + IB adapter importable on this machine
-# (Python 3.13, Windows) during Phase N0's static-inspection pass. Pinned to that exact
-# version until a deliberate upgrade, since adapter config field names are load-bearing.
-ib = [
-    "nautilus_trader[ib]==1.230.0",
-    "anthropic>=0.40",
+# Phase N2: the deterministic quant desks (wit/desks/) — pure pandas/numpy/arch over
+# OHLCV, zero broker or LLM coupling.
+quant = [
     "pandas>=2.0",
     "numpy>=1.26",
     "arch>=6.3",
     "scipy>=1.11",
     "yfinance>=0.2",
+]
+# Phase N3: the LLM committee client.
+committee = [
+    "anthropic>=0.40",
+]
+# nautilus_trader==1.230.0 confirmed installable + IB adapter importable on this machine
+# (Python 3.13, Windows) during Phase N0's static-inspection pass. Pinned to that exact
+# version until a deliberate upgrade, since adapter config field names are load-bearing.
+ib = [
+    "nautilus_trader[ib]==1.230.0",
+    "wit-nautilus[quant]",
+    "wit-nautilus[committee]",
 ]
 research = [
     "vectorbt",
@@ -28,6 +37,8 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.6",
     "mypy>=1.10",
+    "wit-nautilus[quant]",
+    "wit-nautilus[committee]",
 ]
 
 [build-system]

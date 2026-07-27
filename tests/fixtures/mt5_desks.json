@@ -1,0 +1,230 @@
+{
+  "bear": {
+    "garch": {
+      "bars_used": 599,
+      "detail": {
+        "alpha": 0.0,
+        "beta": 0.981,
+        "clamped": false,
+        "converged": true,
+        "nu": 106.81,
+        "omega": 0.00065911,
+        "raw_multiplier": 1.036,
+        "sigma_per_bar": 0.00186218,
+        "target_annual_vol": 0.15,
+        "timeframe": "H1"
+      },
+      "realized_vol": 0.13062,
+      "size_multiplier": 1.036,
+      "symbol": "EURUSD",
+      "vol_forecast": 0.14482,
+      "vol_percentile": 0.562,
+      "vol_regime": "normal"
+    },
+    "markov": {
+      "bars_used": 600,
+      "bear_prob": 0.9966,
+      "bull_prob": 0.0017,
+      "confidence": 0.977,
+      "detail": {
+        "horizon": 1,
+        "regime_occupancy": {
+          "Bear": 1.0
+        },
+        "threshold": "0.75-sigma",
+        "transition_matrix": {
+          "Bear": {
+            "Bear": 0.997,
+            "Bull": 0.002,
+            "Sideways": 0.002
+          },
+          "Bull": {
+            "Bear": 0.333,
+            "Bull": 0.333,
+            "Sideways": 0.333
+          },
+          "Sideways": {
+            "Bear": 0.333,
+            "Bull": 0.333,
+            "Sideways": 0.333
+          }
+        },
+        "window": 20
+      },
+      "direction": "BEAR",
+      "regime": "Bear",
+      "sideways_prob": 0.0017,
+      "signal": -0.9948,
+      "symbol": "EURUSD"
+    },
+    "technicals": {
+      "atr": 0.0010020873795101566,
+      "atr_pct": 0.0026307019580656937,
+      "ema_fast": 0.3858338640111299,
+      "ema_slow": 0.39575360627561934,
+      "last_close": 0.38092014811399344,
+      "range_high": 0.4560788787605226,
+      "range_low": 0.38092014811399344,
+      "range_position": 0.0,
+      "ret_100": -0.16652105477606183,
+      "ret_20": -0.021282227637839712,
+      "rsi": 9.108040592270228,
+      "symbol": "EURUSD",
+      "trend": "down"
+    },
+    "technicals_prompt": "Last close: 0.38092\nTrend (EMA20 vs EMA50): down (fast 0.38583 / slow 0.39575)\nRSI(14): 9.1\nATR(14): 0.00100 (0.26% of price)\n100-bar range: 0.38092 - 0.45608, price sits at 0% of that range\nReturn: -2.13% over 20 bars, -16.65% over 100 bars"
+  },
+  "bull": {
+    "garch": {
+      "bars_used": 599,
+      "detail": {
+        "alpha": 0.0079,
+        "beta": 0.834,
+        "clamped": false,
+        "converged": true,
+        "nu": 128.24,
+        "omega": 0.0054172,
+        "raw_multiplier": 1.051,
+        "sigma_per_bar": 0.00183555,
+        "target_annual_vol": 0.15,
+        "timeframe": "H1"
+      },
+      "realized_vol": 0.13101,
+      "size_multiplier": 1.051,
+      "symbol": "EURUSD",
+      "vol_forecast": 0.14275,
+      "vol_percentile": 0.46,
+      "vol_regime": "normal"
+    },
+    "markov": {
+      "bars_used": 600,
+      "bear_prob": 0.0017,
+      "bull_prob": 0.9913,
+      "confidence": 0.9505,
+      "detail": {
+        "horizon": 1,
+        "regime_occupancy": {
+          "Bull": 0.986,
+          "Sideways": 0.014
+        },
+        "threshold": "0.75-sigma",
+        "transition_matrix": {
+          "Bear": {
+            "Bear": 0.333,
+            "Bull": 0.333,
+            "Sideways": 0.333
+          },
+          "Bull": {
+            "Bear": 0.002,
+            "Bull": 0.991,
+            "Sideways": 0.007
+          },
+          "Sideways": {
+            "Bear": 0.091,
+            "Bull": 0.364,
+            "Sideways": 0.545
+          }
+        },
+        "window": 20
+      },
+      "direction": "BULL",
+      "regime": "Bull",
+      "sideways_prob": 0.007,
+      "signal": 0.9895,
+      "symbol": "EURUSD"
+    },
+    "technicals": {
+      "atr": 0.006298236321744292,
+      "atr_pct": 0.002733096337633446,
+      "ema_fast": 2.268639964641074,
+      "ema_slow": 2.223197930916909,
+      "last_close": 2.304432608181626,
+      "range_high": 2.3055970795111596,
+      "range_low": 2.04611612173211,
+      "range_position": 0.9955123052593134,
+      "ret_100": 0.1250788951396904,
+      "ret_20": 0.0392382994476046,
+      "rsi": 91.57245321153007,
+      "symbol": "EURUSD",
+      "trend": "up"
+    },
+    "technicals_prompt": "Last close: 2.30443\nTrend (EMA20 vs EMA50): up (fast 2.26864 / slow 2.22320)\nRSI(14): 91.6\nATR(14): 0.00630 (0.27% of price)\n100-bar range: 2.04612 - 2.30560, price sits at 100% of that range\nReturn: +3.92% over 20 bars, +12.51% over 100 bars"
+  },
+  "flat": {
+    "garch": {
+      "bars_used": 599,
+      "detail": {
+        "alpha": 0.0,
+        "beta": 0.9811,
+        "clamped": false,
+        "converged": true,
+        "nu": 120.34,
+        "omega": 0.00065874,
+        "raw_multiplier": 1.034,
+        "sigma_per_bar": 0.00186457,
+        "target_annual_vol": 0.15,
+        "timeframe": "H1"
+      },
+      "realized_vol": 0.13081,
+      "size_multiplier": 1.034,
+      "symbol": "EURUSD",
+      "vol_forecast": 0.14501,
+      "vol_percentile": 0.56,
+      "vol_regime": "normal"
+    },
+    "markov": {
+      "bars_used": 600,
+      "bear_prob": 0.0217,
+      "bull_prob": 0.7826,
+      "confidence": 0.4591,
+      "detail": {
+        "horizon": 1,
+        "regime_occupancy": {
+          "Bear": 0.443,
+          "Bull": 0.076,
+          "Sideways": 0.481
+        },
+        "threshold": "0.75-sigma",
+        "transition_matrix": {
+          "Bear": {
+            "Bear": 0.9,
+            "Bull": 0.004,
+            "Sideways": 0.096
+          },
+          "Bull": {
+            "Bear": 0.022,
+            "Bull": 0.783,
+            "Sideways": 0.196
+          },
+          "Sideways": {
+            "Bear": 0.085,
+            "Bull": 0.035,
+            "Sideways": 0.879
+          }
+        },
+        "window": 20
+      },
+      "direction": "BULL",
+      "regime": "Bull",
+      "sideways_prob": 0.1957,
+      "signal": 0.7609,
+      "symbol": "EURUSD"
+    },
+    "technicals": {
+      "atr": 0.0020168944774823154,
+      "atr_pct": 0.0021527034091073714,
+      "ema_fast": 0.935479140489657,
+      "ema_slow": 0.9373219479128567,
+      "last_close": 0.9369123814035442,
+      "range_high": 0.9669683591557618,
+      "range_low": 0.9273195646299363,
+      "range_position": 0.2419447271558165,
+      "ret_100": -0.03163562084577776,
+      "ret_20": 0.008524165991474764,
+      "rsi": 54.731689595421955,
+      "symbol": "EURUSD",
+      "trend": "down"
+    },
+    "technicals_prompt": "Last close: 0.93691\nTrend (EMA20 vs EMA50): down (fast 0.93548 / slow 0.93732)\nRSI(14): 54.7\nATR(14): 0.00202 (0.22% of price)\n100-bar range: 0.92732 - 0.96697, price sits at 24% of that range\nReturn: +0.85% over 20 bars, -3.16% over 100 bars"
+  }
+}
