@@ -121,7 +121,8 @@ def test_review_scores_a_completed_round_trip_from_the_journal_alone(tmp_path, m
     journal.log_decision("NVDA", _D(), _P(), _R(),
                          order={"ok": True, "client_order_id": "O-1"}, client_order_id="O-1")
     journal.log_event("position_closed", "realized_pnl=88.0", symbol="NVDA",
-                      position_id="NVDA.SIM-Strategy-000", realized_pnl=88.0)
+                      position_id="NVDA.SIM-Strategy-000", opening_order_id="O-1",
+                      realized_pnl=88.0)
 
     cli.cmd_review(cli.build_parser().parse_args(["review"]))
     out = capsys.readouterr().out

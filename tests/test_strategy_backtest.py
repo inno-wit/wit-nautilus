@@ -23,6 +23,7 @@ second init entirely and all three tests pass together reliably.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -169,6 +170,33 @@ def test_backtest_produces_journalled_decisions(engine_setup):
         "expected at least one BUY-proposed decision - "
         f"got actions: {sorted({r['action'] for r in decisions})}"
     )
+
+
+def test_journal_entries_are_stamped_with_simulated_time_not_wall_clock(engine_setup):
+    """Phase N7 audit finding, round 8: Journal.write's ts field used to
+    default to real wall-clock datetime.now(UTC) regardless of caller
+    context, so a backtest's journal entries were all stamped with
+    whatever real date the test happened to run on - not the 2026-01-01+
+    simulated dates the bars themselves occupy. Reflection's "last N days"
+    windowing only means anything if entries carry the same clock its
+    caller does. Journal.log_decision/log_event's ts= parameter, threaded
+    from self.clock.utc_now() throughout WitStrategy, fixes this."""
+    import json
+
+    engine, journal_path, _frame = engine_setup
+    engine.run()
+    engine.dispose()
+
+    records = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()]
+    decisions = [r for r in records if r.get("type") == "decision"]
+    assert decisions, "expected at least one journalled decision"
+    for r in decisions:
+        ts = datetime.fromisoformat(r["ts"])
+        assert ts.year == 2026 and ts.month == 1, (
+            f"decision ts={r['ts']!r} is not in the simulated backtest period "
+            "(2026-01) - looks like wall-clock time leaked into the journal"
+        )
 
 
 def test_backtest_places_at_least_one_order(engine_setup):
@@ -379,6 +407,30 @@ def test_realized_pnl_since_sums_every_closed_trade_not_just_the_last(tmp_path):
         "widen the bar window if this becomes flaky"
     )
     assert fund_state._realized_pnl_since(0) == sum(journal_pnls)
+
+
+def test_closed_pnls_rehydrate_from_the_journal_after_a_restart(tmp_path):
+    """Phase N7 audit finding (round-8 verification): _closed_pnls starts
+    empty on every FundStateActor construction, so a mid-day process
+    restart left the daily-loss breaker blind to every trade that closed
+    before the restart - real loss from before and after a restart could
+    sum to roughly double max_daily_loss before the breaker could ever
+    latch. Runs a real backtest (populating the journal with real closed
+    trades), then a second, fresh actor instance against the SAME journal
+    file (simulating a restart) - its on_start() rehydration must recover
+    the first run's trades, not just its own."""
+    _fund_state_1, _journal_1, pnls_after_run_1 = _run_multi_trade_backtest(tmp_path)
+    assert len(pnls_after_run_1) >= 3, "need real trades from the first run to prove rehydration"
+
+    fund_state_2, _journal_2, pnls_after_both_runs = _run_multi_trade_backtest(tmp_path)
+
+    assert len(pnls_after_both_runs) > len(pnls_after_run_1), (
+        "test setup assumption failed: the second run must add its own new closed trades too"
+    )
+    assert fund_state_2._realized_pnl_since(0) == sum(pnls_after_both_runs), (
+        "the second actor's accumulator is missing trades from before its own construction - "
+        "on_start()'s journal rehydration did not recover the first run's history"
+    )
 
 
 def test_daily_loss_breaker_latches_after_multiple_closed_trades(tmp_path, monkeypatch):

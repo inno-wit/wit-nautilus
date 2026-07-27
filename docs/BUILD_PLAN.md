@@ -583,16 +583,70 @@ reconciliation already runs automatically on every `node.run()` connect
 (`LiveExecEngineConfig(reconciliation=True)`, confirmed in N6). Both remain Phase N9's attended
 gate, the same way N6 itself deferred `node.run()` rather than guess at it unverified.
 
+**Round 8 (verification audit) — the chronological join wasn't the fix either, and neither was
+`now=`.** A follow-up audit round, run specifically to verify the C1/C2 fixes above rather than
+to hunt fresh ground, confirmed C1 and C2 themselves are genuinely fixed (re-derived by
+executing a fresh 400-bar `BacktestEngine` run independently of this repo's own test suite:
+`Cache.positions_closed()` held zero of 22 real round trips, `FundStateActor._closed_pnls` held
+all 22, and `_realized_pnl_since` matched the journal's own sum exactly) — but found two of the
+fixes built on top of that redesign didn't hold:
+
+- **The `Reflection.review(now=...)` fix from earlier in this phase never mattered.**
+  `Journal.write` still stamped every record's `ts` with real wall-clock `datetime.now(UTC)`
+  regardless of what `now` a caller passed to `review()` — so `entries_since()`'s window filter
+  was comparing a simulated cutoff against wall-clock-stamped entries, the same "everything
+  written in the last few seconds of real time" degeneration the original H1 fix claimed to
+  close. Reproduced directly: a nominal `days=1` review inside a multi-day backtest still
+  reported a monotonically growing decision count. Fixed properly this time by giving
+  `Journal.log_decision`/`log_event` a `ts=` parameter and threading `self.clock.utc_now()` (or,
+  for fill/close events, the event's own `ts_event`/`ts_closed`) through every call site in
+  `WitStrategy`/`FundStateActor`/`dream.run()` — `Journal.write`'s wall-clock stamp is now only
+  the fallback for a caller with no clock of its own.
+- **The chronological-per-symbol FIFO join (this phase's first fix for C1) was still wrong.**
+  `order.ok=True` on a journalled decision means the order was *submitted*, not that it *filled*
+  — a rejected or cancelled order has no `position_closed` event, so FIFO silently consumed the
+  next real close on that symbol against the decision that never actually traded, permanently
+  offsetting every later pairing on that symbol by one slot. The same FIFO also mis-attributed a
+  trade whose entry or close straddled a review window boundary, and — unlike the doc note this
+  replaced claimed — that skew does *not* self-correct on the next call, since every subsequent
+  pairing on the affected symbol inherits the same one-slot offset. Both reproduced directly
+  against real journal data.
+
+  **Fixed by dropping the chronological assumption entirely** in favor of an exact id match:
+  `PositionClosed.opening_order_id` is a real `ClientOrderId` (confirmed against the installed
+  `nautilus_trader/model/events/position.pyx`, not guessed) — the *same* id `log_decision`
+  already journals as a completed entry's own `client_order_id`. `WitStrategy.on_position_closed`
+  now journals `opening_order_id` alongside `realized_pnl`, and `Reflection.review()` joins on
+  `client_order_id == opening_order_id` directly: a rejected order's id never appears as an
+  `opening_order_id` anywhere, so it's excluded by construction rather than stealing another
+  trade's slot, and a trade whose entry or close falls outside the review window is excluded on
+  its own with zero effect on any other trade's pairing. This is also strictly simpler than the
+  FIFO it replaced — no per-symbol cursor, no chronological-order assumption to state or defend.
+
+  One more gap the same round found and this fix also closes: `FundStateActor._closed_pnls`
+  started empty on every construction, so a process restart mid-day left the daily-loss breaker
+  blind to every trade that closed before the restart — real loss from before and after a
+  restart could sum to roughly double `max_daily_loss` before the breaker could ever latch.
+  `on_start()` now calls a new `_rehydrate_closed_pnls()` that recovers recent closures from the
+  journal itself (which already durably records every one) before the actor does anything else —
+  correct only because journal entries now carry the actor's own clock, not wall-clock time, so
+  this fix depends on the H1 fix above rather than being independent of it. All three are now
+  regression-tested against real multi-trade/multi-restart backtests, not unit-level fakes:
+  journal timestamps land in the simulated bar period (2026-01, never real wall-clock "today");
+  a rejected order provably doesn't offset a later trade; a close whose entry falls outside the
+  window is provably excluded rather than misattributed; and a second, freshly-constructed
+  `FundStateActor` against the same journal file recovers the first run's full trade history.
+
 **Known, accepted residual (non-blocking, noted for N8):** `Journal.log_decision`'s `cycle_id`
-field is still never populated by any caller — dead code, same as before this phase. The N7
-audit flagged a theoretical risk it once posed (two backtest runs over the same simulated
-window, sharing one journal, could produce colliding join keys) that applied to the
-`position_id`-based join this phase replaced; the chronological per-symbol join has no id to
-collide, so the practical risk is gone, but a *concurrent* multi-process sweep sharing one
-journal file could still interleave two runs' entries out of each run's own order. Every
-current call site already gives each backtest its own journal path by construction (matching
-the audit's own suggested mitigation), so this is unreached today — Phase N8's sweep harness
-should either keep that convention explicitly or populate `cycle_id` and filter on it.
+field is still never populated by any caller — dead code, unrelated to either join redesign
+above. Two runs writing to the same journal could still produce colliding `client_order_id`/
+`opening_order_id` values (Nautilus derives them from simulated date + a per-strategy counter
+that restarts at 1 for a fresh strategy instance) — this doesn't corrupt `_closed_pnls` (which
+sums every `position_closed` event unconditionally, id or no id) but could make `Reflection`'s
+dict-keyed join silently prefer one run's trade over the other's for a colliding id. Every
+current call site already gives each backtest its own journal path by construction, so this is
+unreached today — Phase N8's sweep harness should either keep that convention explicitly or
+populate `cycle_id` and filter on it.
 
 ### Phase N8 — Docker / Compose on the VPS
 

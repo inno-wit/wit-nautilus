@@ -58,7 +58,7 @@ def _log_round_trip(journal: Journal, symbol: str, pnl: float, conviction: float
     )
     journal.log_event("position_closed", f"realized_pnl={pnl}",
                       symbol=symbol, position_id=f"{symbol}.SIM-Strategy-000",
-                      realized_pnl=pnl)
+                      opening_order_id=coid, realized_pnl=pnl)
 
 
 # ── Bucket ───────────────────────────────────────────────────────────────
@@ -108,12 +108,62 @@ def test_review_scores_nothing_when_the_position_has_not_closed_yet(tmp_path):
     assert review["trades_scored"] == 0
 
 
-def test_review_pairs_two_round_trips_on_the_same_symbol_chronologically(tmp_path):
+def test_review_ignores_a_rejected_order_without_offsetting_later_trades(tmp_path):
+    """Phase N7 audit finding F2 (round-8 verification): order.ok=True on a
+    decision means the order was SUBMITTED, not that it FILLED - a
+    rejected/cancelled order never gets an order_filled/position_closed
+    event. The chronological-FIFO join this replaced would have consumed
+    the NEXT real close on this symbol against the rejected decision,
+    silently offsetting every later trade on that symbol by one slot. The
+    exact opening_order_id match must not do that: a decision whose
+    client_order_id never appears as an opening_order_id anywhere is simply
+    excluded, with zero effect on any other decision's pairing."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    # Submitted, then rejected - no order_filled, no position_closed ever
+    # references O-1.
+    journal.log_decision("NVDA", _Decision(), _Plan(), _Report(),
+                         order={"ok": True, "client_order_id": "O-1"},
+                         client_order_id="O-1")
+    # A genuine, later round trip on the same symbol.
+    _log_round_trip(journal, "NVDA", pnl=75.0, coid="O-2")
+
+    review = Reflection(journal).review(days=7)
+
+    assert review["decisions_considered"] == 2
+    assert review["trades_scored"] == 1
+    assert review["overall"]["total_pnl"] == 75.0
+
+
+def test_review_excludes_a_close_whose_entry_is_outside_the_window(tmp_path):
+    """Phase N7 audit finding (round-8 verification): the chronological-FIFO
+    join mis-attributed a close whose entry decision fell outside the
+    review window to whatever in-window decision happened to be first in
+    the FIFO queue. The exact-id join has no such coupling: a
+    position_closed event whose opening_order_id matches no in-window
+    decision is simply invisible, and every other decision's pairing is
+    unaffected."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    # A close whose entry decision was never journalled in this window.
+    journal.log_event("position_closed", "realized_pnl=-900.0", symbol="NVDA",
+                      position_id="NVDA.SIM-Strategy-000",
+                      opening_order_id="O-OUTSIDE-WINDOW", realized_pnl=-900.0)
+    # A genuine in-window round trip that must score its own P&L only.
+    _log_round_trip(journal, "NVDA", pnl=50.0, coid="O-2")
+
+    review = Reflection(journal).review(days=7)
+
+    assert review["trades_scored"] == 1
+    assert review["overall"]["total_pnl"] == 50.0
+
+
+def test_review_pairs_two_round_trips_on_the_same_symbol_by_exact_id(tmp_path):
     """The exact production shape the Phase N7 audit's finding C1 broke:
     two independent trades on one symbol, both carrying the SAME Nautilus
-    position_id (a real NETTING artifact - see this module's docstring).
-    Each decision must score against its OWN close, not one replicated
-    across both."""
+    position_id (a real NETTING artifact - see this module's docstring) but
+    distinct opening_order_id/client_order_id values. Each decision must
+    score against its OWN close, not one replicated across both - and,
+    unlike the chronological-FIFO design this replaced, the order the
+    events were journalled in must not matter."""
     journal = Journal(str(tmp_path / "journal.jsonl"))
     _log_round_trip(journal, "NVDA", pnl=100.0, coid="O-1")
     _log_round_trip(journal, "NVDA", pnl=-40.0, coid="O-2")

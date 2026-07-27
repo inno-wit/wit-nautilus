@@ -123,7 +123,7 @@ def _journal_with_n_closed_trades(tmp_path, n: int, pnl: float = 20.0):
                              client_order_id=coid)
         journal.log_event("position_closed", f"realized_pnl={pnl}",
                           symbol="NVDA", position_id="NVDA.SIM-Strategy-000",
-                          realized_pnl=pnl)
+                          opening_order_id=coid, realized_pnl=pnl)
     return journal
 
 

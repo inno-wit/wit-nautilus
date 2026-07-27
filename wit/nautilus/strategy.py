@@ -236,14 +236,21 @@ class WitStrategy(Strategy):
                                        dream=self.fund_state.dream_state)
         plan = TradePlan(symbol=symbol, approved=False, action="HOLD",
                          blocked_by=[decision.rationale])
-        self.journal.log_decision(symbol, decision, plan, report)
+        self.journal.log_decision(symbol, decision, plan, report, ts=self.clock.utc_now())
 
     # -- deliberation callback: runs off-loop, safe to block -----------------
     def _on_decision(self, report: QuantAnalystReport, bar_ts_ns: int) -> None:
         symbol = self.config.symbol
+        # Captured once, used for every journal write in this method
+        # (Phase N7 audit finding, round 8): Journal.write's wall-clock
+        # default made entries_since()'s window filtering compare a
+        # simulated cutoff against wall-clock-stamped entries in a
+        # backtest, degenerating "last N simulated days" into "everything
+        # written in the last few seconds of real time".
+        now = self.clock.utc_now()
         if self.fund_state.is_halted():
             self.journal.log_event("halted", self.fund_state.halt_reason or "halted",
-                                   symbol=symbol)
+                                   symbol=symbol, ts=now)
             return
 
         decision = self.provider.decide(
@@ -253,7 +260,7 @@ class WitStrategy(Strategy):
         account = self._account_snapshot()
         if account is None:
             self.journal.log_event("no_account_snapshot",
-                                   "portfolio/account data unavailable", symbol=symbol)
+                                   "portfolio/account data unavailable", symbol=symbol, ts=now)
             return
 
         quote = self.cache.quote_tick(self.config.instrument_id)
@@ -280,12 +287,12 @@ class WitStrategy(Strategy):
         if plan.approved:
             if quote is None:
                 self.journal.log_event("no_quote_at_execution", "no live quote available",
-                                       symbol=symbol)
+                                       symbol=symbol, ts=now)
             else:
                 reject = revalidate_plan(plan, float(quote.bid_price), float(quote.ask_price),
                                          self.spec, spread)
                 if reject:
-                    self.journal.log_event("revalidation_block", reject, symbol=symbol)
+                    self.journal.log_event("revalidation_block", reject, symbol=symbol, ts=now)
                 # Re-check right before submitting, not just at the top of this
                 # method (Phase N5 audit finding F2): provider.decide() can run
                 # up to ~90s per call, and this whole method runs off-loop via
@@ -296,10 +303,12 @@ class WitStrategy(Strategy):
                 # strategy believes it is flat on.
                 elif not self.is_running:
                     self.journal.log_event("stopped_before_submit",
-                                           "strategy stopped while deliberating", symbol=symbol)
+                                           "strategy stopped while deliberating", symbol=symbol,
+                                           ts=now)
                 elif self.fund_state.is_halted():
                     self.journal.log_event("halted_before_submit",
-                                           self.fund_state.halt_reason or "halted", symbol=symbol)
+                                           self.fund_state.halt_reason or "halted", symbol=symbol,
+                                           ts=now)
                 else:
                     order_result = self._submit(plan)
 
@@ -309,7 +318,7 @@ class WitStrategy(Strategy):
         # decision record's top-level identifier stayed blank.
         client_order_id = (order_result or {}).get("client_order_id", "")
         self.journal.log_decision(symbol, decision, plan, report, order_result,
-                                  client_order_id=client_order_id)
+                                  client_order_id=client_order_id, ts=now)
 
     def _in_cooldown(self) -> bool:
         minutes = CONFIG.risk.cooldown_minutes
@@ -365,6 +374,7 @@ class WitStrategy(Strategy):
             "order_filled", f"{event.order_side} {event.last_qty} @ {event.last_px}",
             symbol=self.config.symbol, client_order_id=str(event.client_order_id),
             position_id=str(event.position_id) if event.position_id else "",
+            ts=unix_nanos_to_dt(event.ts_event),
         )
 
     def on_position_closed(self, event) -> None:
@@ -376,11 +386,26 @@ class WitStrategy(Strategy):
         # Cache.positions_closed() evicts a symbol's prior closed position
         # the moment it's re-entered. This event, journalled once per real
         # round trip as it happens, is the only complete record.
+        #
+        # opening_order_id is a real ClientOrderId (confirmed against the
+        # installed nautilus_trader/model/events/position.pyx, not
+        # guessed) - the SAME id log_decision journals as a completed
+        # entry's top-level client_order_id. Reflection.review() joins on
+        # this directly (Phase N7 audit finding, round 8): the prior
+        # chronological-per-symbol join mis-attributed P&L whenever an
+        # order was submitted but never filled (rejected/cancelled), or
+        # whenever a trade's entry and close straddled a review window
+        # boundary. An exact id match has neither failure mode - and,
+        # since it's the ClientOrderId of the specific order that opened
+        # THIS position (not Nautilus's own NETTING position_id, which is
+        # reused across every trade on a symbol), it carries none of C1's
+        # collision risk either.
         realized_pnl = float(event.realized_pnl)
         self.journal.log_event(
             "position_closed", f"realized_pnl={realized_pnl}",
             symbol=self.config.symbol, position_id=str(event.position_id),
-            realized_pnl=realized_pnl,
+            opening_order_id=str(event.opening_order_id),
+            realized_pnl=realized_pnl, ts=unix_nanos_to_dt(event.ts_closed),
         )
         # Same reasoning feeds the daily-loss breaker and Kelly sizing
         # directly (Phase N7 audit finding C2/H2): FundStateActor's own

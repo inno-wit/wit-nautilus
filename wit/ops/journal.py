@@ -56,6 +56,14 @@ class Journal:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def write(self, record: dict[str, Any]) -> dict[str, Any]:
+        # setdefault, not unconditional: log_decision/log_event's ts=
+        # parameter (Phase N7 audit finding, round 8) lets a Nautilus
+        # caller stamp a record with its OWN clock - self.clock.utc_now()
+        # in live, simulated time in a backtest - instead of the real
+        # wall-clock default below. Without this, entries_since()'s window
+        # filtering was comparing a simulated cutoff against wall-clock-
+        # stamped entries, silently turning "last N simulated days" into
+        # "everything written in the last few seconds of real time".
         record.setdefault("ts", datetime.now(UTC).isoformat())
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=_default) + "\n")
@@ -82,9 +90,9 @@ class Journal:
     def log_decision(
         self, symbol: str, decision, plan, report,
         order: dict | None = None, position_id: str = "", client_order_id: str = "",
-        cycle_id: str = "",
+        cycle_id: str = "", ts: datetime | None = None,
     ) -> dict[str, Any]:
-        return self.write({
+        record: dict[str, Any] = {
             "type": "decision",
             "cycle_id": cycle_id,
             "symbol": symbol,
@@ -96,7 +104,14 @@ class Journal:
             "plan": plan.to_dict(),
             "quant": report.to_dict(),
             "order": order,
-        })
+        }
+        if ts is not None:
+            record["ts"] = ts.isoformat()
+        return self.write(record)
 
-    def log_event(self, kind: str, message: str, **extra: Any) -> dict[str, Any]:
-        return self.write({"type": "event", "kind": kind, "message": message, **extra})
+    def log_event(self, kind: str, message: str, ts: datetime | None = None,
+                  **extra: Any) -> dict[str, Any]:
+        record: dict[str, Any] = {"type": "event", "kind": kind, "message": message, **extra}
+        if ts is not None:
+            record["ts"] = ts.isoformat()
+        return self.write(record)

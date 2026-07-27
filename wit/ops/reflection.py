@@ -9,8 +9,7 @@ Deliberately statistics-first: it reports edge by symbol, Markov regime, vol
 regime and conviction bucket. No LLM is required to produce it.
 
 Ported from ``Wit-Hedge-fund/engine/reflection.py`` (Phase N7). The join key
-changes twice over this port's history, and the second change is the one
-that actually works:
+has changed three times over this port's history:
 
 1. The MT5 build had one broker-side ticket per order, so ``review()`` took
    ``deals_by_ticket: dict[int, float]`` straight from the broker.
@@ -26,17 +25,31 @@ that actually works:
    position from its closed-position index the instant that symbol is
    re-entered. The join either found nothing, or silently scored every
    decision on a symbol against whichever single trade happened to survive.
+3. The follow-up fix paired each symbol's executed decisions with its
+   ``position_closed`` events chronologically (FIFO per symbol), reasoning
+   that ``RiskConfig.per_symbol_max_positions = 1`` guarantees strict
+   alternation. **This was closer, but still wrong** (round-8 verification
+   audit, again by execution): an order journalled as ``ok`` means
+   *submitted*, not *filled* - a rejected or cancelled order has no
+   ``position_closed`` event, so it silently ate the next real close's slot
+   in the FIFO queue, permanently offsetting every later pairing on that
+   symbol. The same FIFO also mis-attributed a trade whose entry fell just
+   before a review window and whose close fell just after it, and vice
+   versa - not self-correcting, since every later pairing on that symbol
+   inherits the same one-slot offset.
 
-This version needs no cache and no position id at all. ``WitStrategy``
-already journals a structured ``realized_pnl`` on every real
-``on_position_closed`` event (see that module), which - unlike ``Cache`` -
-is never evicted; it is simply appended to the journal once per genuine
-round trip, in order. Since ``RiskConfig.per_symbol_max_positions = 1``
-means a symbol can only ever have one position open at a time, its
-entries (executed decisions) and its closes (``position_closed`` events)
-must alternate strictly in journal order - so the *n*-th executed decision
-on a symbol pairs with the *n*-th close on that same symbol, with no id
-needed to prove it. The aggregation logic itself (win rate by
+This version needs no cache, no chronological assumption, and no ambient
+Nautilus ``position_id`` at all - it joins on an **exact id**:
+``WitStrategy.on_position_closed`` journals ``opening_order_id``, which
+Nautilus sets to the real ``ClientOrderId`` of the specific order that
+opened that position (confirmed against the installed
+``nautilus_trader/model/events/position.pyx``, not guessed) - the *same* id
+``log_decision`` already journals as a completed entry's top-level
+``client_order_id``. A decision whose order was rejected/cancelled never
+gets a matching close, so it is correctly excluded rather than stealing
+another trade's slot; a trade whose entry or close falls outside the review
+window is correctly excluded on its own, with no cascading effect on any
+other trade. The aggregation logic itself (win rate by
 symbol/regime/vol-regime/conviction) is unchanged from the MT5 build.
 """
 from __future__ import annotations
@@ -70,18 +83,17 @@ class Bucket:
         }
 
 
-def _closed_trades_by_symbol(entries: list[dict[str, Any]]) -> dict[str, list[float]]:
-    """Realized P&L per symbol, in journal (chronological) order, from
-    ``WitStrategy.on_position_closed``'s own structured ``realized_pnl``
-    field - see this module's docstring for why that, and not
-    ``position_id``, is the join key."""
-    out: dict[str, list[float]] = defaultdict(list)
+def _pnl_by_opening_order_id(entries: list[dict[str, Any]]) -> dict[str, float]:
+    """Realized P&L keyed by the ``ClientOrderId`` of the order that opened
+    the position - see this module's docstring for why this, and not
+    ``position_id`` or chronological order, is the join key."""
+    out: dict[str, float] = {}
     for rec in entries:
         if rec.get("type") != "event" or rec.get("kind") != "position_closed":
             continue
-        symbol, pnl = rec.get("symbol"), rec.get("realized_pnl")
-        if symbol and pnl is not None:
-            out[symbol].append(float(pnl))
+        opening_order_id, pnl = rec.get("opening_order_id"), rec.get("realized_pnl")
+        if opening_order_id and pnl is not None:
+            out[opening_order_id] = float(pnl)
     return out
 
 
@@ -94,8 +106,9 @@ class Reflection:
         return "0.0-0.3" if c < 0.3 else "0.3-0.6" if c < 0.6 else "0.6-1.0"
 
     def review(self, days: int = 7, now: datetime | None = None) -> dict[str, Any]:
-        """Join journaled decisions to realized P&L by chronological
-        position within each symbol (see this module's docstring for why).
+        """Join journaled decisions to realized P&L by an exact
+        ``client_order_id == opening_order_id`` match (see this module's
+        docstring for why).
 
         ``now`` must be the caller's own clock, not a bare
         ``datetime.now(UTC)`` default (Phase N7 audit finding H1, the same
@@ -105,19 +118,16 @@ class Reflection:
         window there degenerates to "everything the journal has ever
         recorded", proven by a real multi-day backtest reporting a
         monotonically growing decision count from a nominal 1-day window.
-
-        Note: a decision entered just before the window boundary whose
-        closing trade lands just after it will misalign this symbol's FIFO
-        pairing by one trade for this window only - an inherent edge of any
-        sliding-window join over an append-only log, self-correcting on the
-        next call. Not the same failure mode as C1 (which corrupted every
-        trade, every window, permanently).
+        This only works because every journal write in the live/backtest
+        path now stamps ``ts`` from the same clock (``Journal.log_decision``/
+        ``log_event``'s ``ts=`` parameter) - passing ``now`` here alone is
+        not sufficient if the entries themselves are still wall-clock
+        stamped.
         """
         now = now or datetime.now(UTC)
         since = now - timedelta(days=days)
         entries = self.journal.entries_since(since)
-        closed_by_symbol = _closed_trades_by_symbol(entries)
-        cursor: dict[str, int] = defaultdict(int)
+        pnl_by_opening_order = _pnl_by_opening_order_id(entries)
 
         overall = Bucket()
         by_symbol: dict[str, Bucket] = defaultdict(Bucket)
@@ -133,15 +143,13 @@ class Reflection:
             order = rec.get("order") or {}
             if not order.get("ok"):
                 continue
-            symbol = rec["symbol"]
-            closes = closed_by_symbol.get(symbol, [])
-            idx = cursor[symbol]
-            if idx >= len(closes):
-                continue  # this position hasn't closed yet (still open, or outside the window)
-            pnl = closes[idx]
-            cursor[symbol] = idx + 1
+            coid = rec.get("client_order_id") or order.get("client_order_id")
+            if not coid or coid not in pnl_by_opening_order:
+                continue  # submitted but never filled, or its close falls outside this window
+            pnl = pnl_by_opening_order[coid]
 
             executed += 1
+            symbol = rec["symbol"]
             quant = rec.get("quant", {})
             committee = rec.get("committee", {})
 

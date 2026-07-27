@@ -266,7 +266,7 @@ def run(
     journal.log_event(
         "dream_cycle",
         f"{len(lessons)} lesson(s), {len(scores)} prior lesson(s) scored",
-        **state.to_dict(),
+        ts=now, **state.to_dict(),
     )
     return state
 

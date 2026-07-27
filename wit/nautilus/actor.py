@@ -130,13 +130,45 @@ class FundStateActor(Actor):
         fed once per genuine round trip, in ``WitStrategy``'s own real-time
         event, and never gets evicted."""
         self._closed_pnls.append((ts_ns, realized_pnl))
+        self._prune_closed_pnls()
+
+    def _prune_closed_pnls(self) -> None:
         cutoff_ns = int(
             (self.clock.utc_now() - timedelta(days=_PNL_RETENTION_DAYS)).timestamp() * 1_000_000_000
         )
         self._closed_pnls = [(ts, pnl) for ts, pnl in self._closed_pnls if ts >= cutoff_ns]
 
+    def _rehydrate_closed_pnls(self) -> None:
+        """Recover recent realized P&L from the journal at startup (Phase N7
+        audit finding, round 8): ``_closed_pnls`` starts empty on every
+        actor construction, so a mid-day process restart left the
+        daily-loss breaker blind to every trade that closed before the
+        restart - realized loss from before and after a restart could sum
+        to roughly double ``max_daily_loss`` before the breaker could ever
+        latch. The journal already durably records every closure
+        (``WitStrategy.on_position_closed``), so this reads it back rather
+        than inventing a second persistence mechanism. Depends on journal
+        entries being stamped with the caller's own clock, not wall-clock
+        time (see ``Journal.log_event``'s ``ts=`` parameter) - otherwise
+        this filter would silently be comparing the wrong time domain in a
+        backtest, the same bug class this phase's H1 fix addressed."""
+        cutoff = self.clock.utc_now() - timedelta(days=_PNL_RETENTION_DAYS)
+        for rec in self.journal.entries_since(cutoff):
+            if rec.get("type") != "event" or rec.get("kind") != "position_closed":
+                continue
+            pnl, ts_str = rec.get("realized_pnl"), rec.get("ts")
+            if pnl is None or not ts_str:
+                continue
+            try:
+                ts_ns = int(datetime.fromisoformat(ts_str).timestamp() * 1_000_000_000)
+            except ValueError:
+                continue
+            self._closed_pnls.append((ts_ns, float(pnl)))
+        self._prune_closed_pnls()
+
     # -- lifecycle -----------------------------------------------------------
     def on_start(self) -> None:
+        self._rehydrate_closed_pnls()
         self._poll_once()
         self.clock.set_timer(
             name="fund_state_poll",
@@ -211,7 +243,8 @@ class FundStateActor(Actor):
             ]
             self.alerter.send("\n".join(lines))
         except Exception as e:  # noqa: BLE001 - a briefing outage must not halt trading
-            self.journal.log_event("briefing_error", f"{type(e).__name__}: {e}")
+            self.journal.log_event("briefing_error", f"{type(e).__name__}: {e}",
+                                   ts=self.clock.utc_now())
 
     def _on_daily_review(self, event) -> None:
         """End-of-day Reflection summary: realized P&L vs. the thesis that
@@ -221,7 +254,8 @@ class FundStateActor(Actor):
             review = Reflection(self.journal).review(days=1, now=self.clock.utc_now())
             self.alerter.send(Reflection.format(review))
         except Exception as e:  # noqa: BLE001 - a review outage must not halt trading
-            self.journal.log_event("review_error", f"{type(e).__name__}: {e}")
+            self.journal.log_event("review_error", f"{type(e).__name__}: {e}",
+                                   ts=self.clock.utc_now())
 
     def _on_weekly_dream(self, event) -> None:
         """Weekly self-review (build plan Phase N7) — Reflection's aggregate
@@ -230,7 +264,8 @@ class FundStateActor(Actor):
         capable of ``.dream()`` was wired in - true for every backtest/sweep
         using ``StubPolicyProvider``/``ReplayCommitteeProvider``."""
         if self.committee is None or not hasattr(self.committee, "dream"):
-            self.journal.log_event("dream_skipped", "no dream-capable committee configured")
+            self.journal.log_event("dream_skipped", "no dream-capable committee configured",
+                                   ts=self.clock.utc_now())
             return
         try:
             # self.config.dream_state_path - required, no fallback default
@@ -243,7 +278,8 @@ class FundStateActor(Actor):
             self.dream_state = state
             self.alerter.send(dream_mod.format_digest(state))
         except Exception as e:  # noqa: BLE001 - a dream-cycle outage must not halt trading
-            self.journal.log_event("dream_error", f"{type(e).__name__}: {e}")
+            self.journal.log_event("dream_error", f"{type(e).__name__}: {e}",
+                                   ts=self.clock.utc_now())
 
     def _poll_once(self) -> None:
         self._check_kill_switch()
