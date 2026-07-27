@@ -175,7 +175,6 @@ class Config:
     history_bars: int = 750
 
     journal_path: str = str(PROJECT_ROOT / "data" / "journal.jsonl")
-    dream_state_path: str = str(PROJECT_ROOT / "data" / "dream_state.json")
     decision_cache_path: str = str(PROJECT_ROOT / "data" / "decisions.db")
 
 

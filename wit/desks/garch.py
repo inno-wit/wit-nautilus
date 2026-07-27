@@ -36,7 +36,19 @@ _STORM_PCTL = 0.80
 
 
 def _annualize(sigma_per_bar: float, timeframe: str) -> float:
-    return float(sigma_per_bar * np.sqrt(BARS_PER_YEAR.get(timeframe, 252)))
+    """Raises on an unrecognized ``timeframe`` rather than defaulting to 252 bars/year
+    (the MT5 original's behavior). That default was harmless there because every caller
+    passed an "H1"/"M15"-style literal; it stops being harmless once NautilusTrader
+    ``BarType`` strings (e.g. "1-HOUR-LAST") reach this desk in Phase N5+ — a silent
+    wrong annualization skews ``size_multiplier`` by roughly 2x with no error and no
+    journal trail (see the Phase N2 audit, finding F1). Callers must pass a key that
+    exists in ``BARS_PER_YEAR``, translating a Nautilus bar spec first if needed."""
+    if timeframe not in BARS_PER_YEAR:
+        raise ValueError(
+            f"unrecognized timeframe {timeframe!r} for GARCH annualization; "
+            f"expected one of {sorted(BARS_PER_YEAR)}"
+        )
+    return float(sigma_per_bar * np.sqrt(BARS_PER_YEAR[timeframe]))
 
 
 def _classify(percentile: float) -> VolRegime:

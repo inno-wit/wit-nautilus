@@ -222,8 +222,12 @@ comparison is invalid.
 
 ### Phase N3 — Committee port + `DecisionProvider`
 
-Port `CommitteeDecision` (incl. `.abstain()`, `distinctiveness()`, `model`/`served_model` audit
-fields) and the bull/bear/PM prompts verbatim, forced-tool-use schema unchanged. Split the
+**Already landed in N2** (`wit/committee/contract.py`): the `CommitteeDecision` dataclass,
+`.abstain()`, `distinctiveness()`, `model`/`served_model` fields — pulled forward because
+`wit/ops/prefilter.py` needed it to construct synthetic HOLDs, and confirmed by the Phase N2
+audit to have zero LLM/network dependencies. Directly tested in
+`tests/test_committee_contract.py`. What's left here is everything that actually talks to a
+model: the bull/bear/PM prompts verbatim, forced-tool-use schema unchanged. Split the
 client into `provider.py` (protocol), `live.py` (async Anthropic + async `_RateLimiter` —
 **never a thread-blocking `time.sleep` on the event loop**), `replay.py` (SQLite decision cache
 keyed by `(instrument_id, bar_ts_ns, sha256(prompt_block))`, `strict`/`record` modes),
@@ -270,6 +274,16 @@ recompute timer, and the three cron-equivalents (`clock.set_time_alert`) — dai
 00:05 UTC, daily review 23:55 UTC, weekly dream **Sunday 22:30 UTC** (moved from the MT5
 build's 21:00 to avoid IB's ~21:00–21:15 UTC daily gateway restart window).
 
+**Owed from N2 (audit finding F8):** `wit/ops/market_hours.py::is_tradeable` was deliberately
+decoupled from `CommitteeDecision` (returns `(bool, str)` only) — the MT5 original's
+`market_closed_hold(symbol, reason)` helper (`model="market_hours"`,
+`detail={"market_closed": True, "reason": ...}`) was dropped rather than ported, on the
+assumption the strategy call site would rebuild it. **`WitStrategy` must reconstruct those exact
+two marker fields** when it builds the HOLD for a closed-equity bar — without them, reflection
+and the dream cycle can't distinguish a session HOLD from a real committee HOLD, and closed-market
+bars would silently pollute the win-rate buckets the dream cycle learns from. Pin this in a test
+alongside `prefilter.synthetic_hold`'s existing `detail.prefiltered` marker test.
+
 **Gate:** a ≥3-month backtest with `StubPolicyProvider` completes and produces orders/fills/
 journal in the same shape as the MT5 build. Then a small-subset run with `ReplayCommitteeProvider`
 in `record` mode proves the LLM path end-to-end offline.
@@ -288,10 +302,19 @@ on paper and appears in the journal with a Nautilus position id.
 
 ### Phase N7 — CLI, journal, reflection, dream, alerts
 
+**Owed from N2 (audit finding F2):** `Technicals.rsi` is `nan` on a zero-loss window (constant/
+monotonic tape, inherited verbatim from the MT5 build, where it was never actually written to
+JSON). `journal.py` writes `QuantAnalystReport.to_dict()` straight to JSONL — a bare `NaN` isn't
+valid JSON (RFC 8259), so that record silently breaks any non-Python reader (`jq`, `JSON.parse`).
+Clamp `rsi` to a neutral 50.0 when there are no losses in the window before wiring this up.
+
 `journal.py` verbatim (+ `position_id`/`client_order_id` fields). `reflection.py`'s input
 changes from MT5 deal-P&L-by-ticket to `self.cache.positions_closed()` keyed by position id —
 the aggregation logic (win rate by symbol/regime/vol-regime/conviction) is unchanged.
-`dream.py` verbatim, `alerts.py` verbatim. CLI: `doctor` (the direct analogue of the MT5
+**`dream.py`'s state layer already landed in N2** (`wit/ops/dream.py`: `DreamState`/`Lesson`/
+`LessonScore`/`load`/`save`, directly tested in `tests/test_dream_state.py`) — what's left here
+is the orchestration half only: `run()` (the weekly LLM call, wired to `Reflection`/`Journal`)
+and `format_digest()`. `alerts.py` verbatim. CLI: `doctor` (the direct analogue of the MT5
 build's — connectivity, all-watchlist instrument resolution, one LLM round-trip, kill-switch
 state), `backtest`/`sweep`, `paper`/`live` (`live` requires an explicit `--i-know` flag),
 `halt`/`resume`/`status`/`reconcile`.

@@ -53,5 +53,5 @@ def is_tradeable(
     return (
         False,
         (f"outside US equity cash session "
-         f"({cfg.cash_open:%H:%M}-{cfg.cash_close:%H:%M} ET)"),
+         f"({cfg.cash_open:%H:%M}–{cfg.cash_close:%H:%M} ET)"),
     )
