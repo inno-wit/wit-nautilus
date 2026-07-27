@@ -128,7 +128,18 @@ class FundStateActor(Actor):
         both the daily-loss breaker and the reflection/dream P&L pipeline
         read 0.0 / nothing after real closed trades). This accumulator is
         fed once per genuine round trip, in ``WitStrategy``'s own real-time
-        event, and never gets evicted."""
+        event, and never gets evicted.
+
+        Not lock-protected (Phase N7 audit finding, round 8): the
+        append-then-rebuild in ``_prune_closed_pnls`` is a read-modify-write
+        that would lose an entry under a genuine race. Safe today only
+        because Nautilus dispatches every ``on_*`` event handler - including
+        ``on_position_closed``, the sole caller - from the single event-loop
+        thread; ``WitStrategy`` only ever leaves that thread inside
+        ``run_in_executor`` for ``_on_bar_work``/``_on_decision``, neither of
+        which touches this method. If a future change ever calls this from
+        an executor thread, it needs a lock first.
+        """
         self._closed_pnls.append((ts_ns, realized_pnl))
         self._prune_closed_pnls()
 

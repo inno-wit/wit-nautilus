@@ -129,8 +129,16 @@ class DreamState:
 
 
 def load(path: str | Path | None = None) -> DreamState:
-    """A missing or corrupt state file must never block trading."""
-    path = Path(path or CONFIG.dream.state_path)
+    """A missing or corrupt state file must never block trading.
+
+    ``path is None`` (the caller has none of its own) falls back to
+    ``CONFIG.dream.state_path`` - but an explicit falsy value like ``""``
+    does not (Phase N7 audit finding, round 8's F5): ``FundStateActorConfig
+    .dream_state_path`` has no default and is required by every caller, so
+    the only way ``""`` reaches here is a caller passing it deliberately,
+    and silently redirecting that to the production path would be the same
+    class of bug M1 closed for the config field, one layer down."""
+    path = Path(path) if path is not None else Path(CONFIG.dream.state_path)
     if not path.exists():
         return DreamState.empty()
     try:
@@ -140,7 +148,7 @@ def load(path: str | Path | None = None) -> DreamState:
 
 
 def save(state: DreamState, path: str | Path | None = None) -> None:
-    path = Path(path or CONFIG.dream.state_path)
+    path = Path(path) if path is not None else Path(CONFIG.dream.state_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
 
