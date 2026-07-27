@@ -8,6 +8,7 @@ Ported verbatim from ``Wit-Hedge-fund/engine/alerts.py`` (Phase N7).
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import urllib.error
@@ -47,6 +48,12 @@ class Alerter:
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return resp.status == 200
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
+        # http.client.HTTPException (e.g. IncompleteRead, BadStatusLine)
+        # derives from Exception, not OSError, and would otherwise escape
+        # this catch (Phase N7 audit finding L3) - every caller already
+        # wraps send() in its own except Exception, so this was never a
+        # live crash risk, but the docstring's "every send failure is
+        # swallowed" should actually be true here, not just downstream.
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as e:
             print(f"[alert] Telegram send failed (trading unaffected): {e}")
             return False

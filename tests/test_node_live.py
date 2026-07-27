@@ -134,6 +134,7 @@ def test_build_config_sets_an_explicit_market_data_type():
 def _fund_state():
     return FundStateActor(FundStateActorConfig(
         venue=node_live.IB_VENUE, kill_switch_file="unused_in_this_test",
+        dream_state_path="unused_in_this_test",
     ))
 
 

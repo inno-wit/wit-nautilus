@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from wit.ops import dream
 from wit.ops.journal import Journal
@@ -77,39 +77,6 @@ def test_build_lessons_fills_basis_numbers_from_qualifying_not_the_llm():
     assert lessons[0].basis_win_rate == 0.25
 
 
-# ── pnl_by_position ─────────────────────────────────────────────────────
-
-@dataclass
-class _FakePosition:
-    id: str
-    ts_closed: int | None
-    realized_pnl: float | None
-
-
-class _FakeCache:
-    def __init__(self, positions):
-        self._positions = positions
-
-    def positions_closed(self):
-        return self._positions
-
-
-def _ns(dt: datetime) -> int:
-    return int(dt.timestamp() * 1_000_000_000)
-
-
-def test_pnl_by_position_filters_to_the_window_and_drops_unclosed():
-    now = datetime.now(UTC)
-    cache = _FakeCache([
-        _FakePosition("P-1", _ns(now), 100.0),                      # in window
-        _FakePosition("P-2", _ns(now - timedelta(days=30)), 50.0),  # outside window
-        _FakePosition("P-3", None, 10.0),                            # still open
-        _FakePosition("P-4", _ns(now), None),                        # no realized pnl yet
-    ])
-    result = dream.pnl_by_position(cache, now - timedelta(days=1))
-    assert result == {"P-1": 100.0}
-
-
 # ── run() / format_digest() ─────────────────────────────────────────────
 
 class _FakeDreamCommittee:
@@ -145,27 +112,29 @@ class _Report:
 
 
 def _journal_with_n_closed_trades(tmp_path, n: int, pnl: float = 20.0):
+    """``n`` completed round trips on NVDA, all sharing the same Nautilus
+    position_id - the real NETTING shape (Phase N7 audit finding C1) that
+    made the id-based join this replaced score 0 or N copies of one trade."""
     journal = Journal(str(tmp_path / "journal.jsonl"))
-    positions = []
     for i in range(n):
-        coid, pid = f"O-{i}", f"P-{i}"
+        coid = f"O-{i}"
         journal.log_decision("NVDA", _Decision(), _Plan(), _Report(),
                              order={"ok": True, "client_order_id": coid},
                              client_order_id=coid)
-        journal.log_event("order_filled", "fill", symbol="NVDA",
-                          client_order_id=coid, position_id=pid)
-        positions.append(_FakePosition(pid, _ns(datetime.now(UTC)), pnl))
-    return journal, _FakeCache(positions)
+        journal.log_event("position_closed", f"realized_pnl={pnl}",
+                          symbol="NVDA", position_id="NVDA.SIM-Strategy-000",
+                          realized_pnl=pnl)
+    return journal
 
 
 def test_run_produces_no_lessons_below_the_sample_floor(tmp_path):
-    journal, cache = _journal_with_n_closed_trades(tmp_path, n=2)
+    journal = _journal_with_n_closed_trades(tmp_path, n=2)
     committee = _FakeDreamCommittee([])
     from wit.config import DreamConfig
     cfg = DreamConfig(state_path=str(tmp_path / "state.json"), window_days=30,
                       min_bucket_trades=5)
 
-    state = dream.run(committee, cache, journal, cfg)
+    state = dream.run(committee, journal, cfg)
 
     assert state.lessons == []
     assert committee.calls == 0  # never even asked - qualifying was empty
@@ -173,7 +142,7 @@ def test_run_produces_no_lessons_below_the_sample_floor(tmp_path):
 
 
 def test_run_calls_the_committee_and_saves_state_above_the_sample_floor(tmp_path):
-    journal, cache = _journal_with_n_closed_trades(tmp_path, n=5)
+    journal = _journal_with_n_closed_trades(tmp_path, n=5)
     raw = [{"lesson": "NVDA BUYs win here", "dimension": "symbol",
            "key": "NVDA", "confidence": "medium"}]
     committee = _FakeDreamCommittee(raw)
@@ -181,7 +150,7 @@ def test_run_calls_the_committee_and_saves_state_above_the_sample_floor(tmp_path
     cfg = DreamConfig(state_path=str(tmp_path / "state.json"), window_days=30,
                       min_bucket_trades=5)
 
-    state = dream.run(committee, cache, journal, cfg)
+    state = dream.run(committee, journal, cfg)
 
     assert committee.calls == 1
     assert len(state.lessons) == 1
@@ -190,36 +159,36 @@ def test_run_calls_the_committee_and_saves_state_above_the_sample_floor(tmp_path
 
 
 def test_run_uses_the_passed_now_not_wall_clock(tmp_path):
-    """Phase N5 audit F1/F3's bug class, re-caught in Phase N7:
-    FundStateActor's weekly timer runs on simulated time in a backtest,
-    which can be months away from wall-clock "now" - dream.run() must use
-    the caller's clock (here, an explicit `now`) both for generated_at and
-    for pnl_by_position's cutoff, never a bare datetime.now(UTC) default."""
-    journal, cache = _journal_with_n_closed_trades(tmp_path, n=2)
+    """Phase N5 audit F1/F3's bug class, re-caught by the Phase N7 audit's
+    finding H1: FundStateActor's weekly timer runs on simulated time in a
+    backtest, which can be months away from wall-clock "now" - dream.run()
+    must use the caller's clock (here, an explicit `now`), never a bare
+    datetime.now(UTC) default, for generated_at and for the review window."""
+    journal = _journal_with_n_closed_trades(tmp_path, n=2)
     committee = _FakeDreamCommittee([])
     from wit.config import DreamConfig
     cfg = DreamConfig(state_path=str(tmp_path / "state.json"))
     simulated_now = datetime(2026, 1, 4, 22, 30, tzinfo=UTC)
 
-    state = dream.run(committee, cache, journal, cfg, now=simulated_now)
+    state = dream.run(committee, journal, cfg, now=simulated_now)
 
     assert state.generated_at == simulated_now.isoformat()
 
 
 def test_run_journals_a_dream_cycle_event(tmp_path):
-    journal, cache = _journal_with_n_closed_trades(tmp_path, n=2)
+    journal = _journal_with_n_closed_trades(tmp_path, n=2)
     committee = _FakeDreamCommittee([])
     from wit.config import DreamConfig
     cfg = DreamConfig(state_path=str(tmp_path / "state.json"))
 
-    dream.run(committee, cache, journal, cfg)
+    dream.run(committee, journal, cfg)
 
     events = [r for r in journal.read() if r.get("kind") == "dream_cycle"]
     assert len(events) == 1
 
 
 def test_run_scores_the_previous_cycles_lessons(tmp_path):
-    journal, cache = _journal_with_n_closed_trades(tmp_path, n=5, pnl=20.0)
+    journal = _journal_with_n_closed_trades(tmp_path, n=5, pnl=20.0)
     from wit.config import DreamConfig
     cfg = DreamConfig(state_path=str(tmp_path / "state.json"), min_bucket_trades=5)
     dream.save(dream.DreamState(
@@ -229,7 +198,7 @@ def test_run_scores_the_previous_cycles_lessons(tmp_path):
     ), cfg.state_path)
     committee = _FakeDreamCommittee([])
 
-    state = dream.run(committee, cache, journal, cfg)
+    state = dream.run(committee, journal, cfg)
 
     assert len(state.scores) == 1
     assert state.scores[0].trades_since == 5

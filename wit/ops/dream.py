@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -212,32 +212,8 @@ class DreamCommittee(Protocol):
     ) -> list[dict[str, Any]]: ...
 
 
-class PositionsCache(Protocol):
-    """Duck-types Nautilus's ``Cache`` for the one method this module needs
-    - ``wit/nautilus/actor.py``'s ``FundStateActor`` passes ``self.cache``
-    directly; tests can pass anything with the same shape."""
-
-    def positions_closed(self) -> list[Any]: ...
-
-
-def pnl_by_position(cache: PositionsCache, since: datetime) -> dict[str, float]:
-    """Realized P&L per closed position id since ``since`` - the Nautilus
-    equivalent of the MT5 build's ``broker.deals_pnl_by_entry_ticket()``.
-    Mirrors ``FundStateActor._realized_pnl_since``'s unfiltered
-    ``positions_closed()`` query (Phase N6 audit finding F3): this system
-    runs one executor per broker account, so every closed position in the
-    cache belongs to this fund regardless of which instrument venue it
-    traded on."""
-    since_ns = int(since.timestamp() * 1_000_000_000)
-    out: dict[str, float] = {}
-    for pos in cache.positions_closed():
-        if pos.ts_closed is not None and pos.ts_closed >= since_ns and pos.realized_pnl is not None:
-            out[str(pos.id)] = float(pos.realized_pnl)
-    return out
-
-
 def run(
-    committee: DreamCommittee, cache: PositionsCache, journal: Journal,
+    committee: DreamCommittee, journal: Journal,
     cfg: DreamConfig | None = None, now: datetime | None = None,
 ) -> DreamState:
     """One weekly self-review. Never raises internally - every step already
@@ -245,21 +221,25 @@ def run(
     prior state) - but the caller (``FundStateActor``'s weekly timer) still
     wraps this defensively, matching the MT5 build's scheduler posture.
 
+    No ``cache`` argument (Phase N7 audit finding C1 - this function used to
+    take one, to build a ``pnl_by_position`` dict keyed by Nautilus
+    ``position_id``, which is not a trade identifier under
+    ``OmsType.NETTING``, the only OMS this system runs; see
+    ``wit/ops/reflection.py``'s module docstring for the full story).
+    ``Reflection.review()`` now reads realized P&L straight from the journal.
+
     ``now`` must be the caller's own clock, not a bare ``datetime.now(UTC)``
-    default - ``pnl_by_position``'s cutoff has to sit in the same time
-    domain as ``pos.ts_closed``, which is *simulated* time in a backtest
-    (the Phase N5 audit's F1/F3 class of bug: wall-clock "now" is months
-    away from the bars actually being processed). ``FundStateActor``'s
-    weekly timer passes ``self.clock.utc_now()``; the default here only
-    exists for a manual/CLI invocation with no clock of its own.
+    default (the Phase N5 audit's F1/F3 class of bug: wall-clock "now" is
+    months away from the bars actually being processed in a backtest).
+    ``FundStateActor``'s weekly timer passes ``self.clock.utc_now()``; the
+    default here only exists for a manual/CLI invocation with no clock of
+    its own.
     """
     cfg = cfg or CONFIG.dream
     now = now or datetime.now(UTC)
     previous = load(cfg.state_path)
 
-    since = now - timedelta(days=cfg.window_days)
-    pnl_map = pnl_by_position(cache, since)
-    review = Reflection(journal).review(pnl_map, days=cfg.window_days)
+    review = Reflection(journal).review(days=cfg.window_days, now=now)
 
     scores = _score_previous_lessons(previous, review) if previous.lessons else []
     qualifying = _qualifying_buckets(review, cfg.min_bucket_trades)

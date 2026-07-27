@@ -66,18 +66,30 @@ def _next_weekly(now: datetime, weekday: int, hour: int, minute: int) -> datetim
     return candidate
 
 
+# How long record_realized_pnl() keeps a closed trade in memory. Generous on
+# purpose - closures on an 8-symbol watchlist are infrequent, so the memory
+# cost of erring high is negligible, while erring low would silently starve
+# the daily-loss breaker or a wide Kelly/dream lookback window (Phase N7
+# audit findings C2/H2 - see record_realized_pnl's own docstring for why
+# this accumulator exists instead of a Cache query).
+_PNL_RETENTION_DAYS = 90
+
+
 class FundStateActorConfig(ActorConfig, frozen=True):
     venue: Venue
-    # kill_switch_file has NO default (Phase N5 audit finding F4): the actor
-    # previously fell back to CONFIG.safety.kill_switch_file - the real,
-    # production kill-switch path - whenever a caller omitted it. A backtest
-    # or parameter sweep that trips the daily-loss breaker (routine, at
-    # 0.5%-per-trade risk over any real drawdown) would then write the LIVE
-    # kill switch, halting the actual fund the next time it starts. Every
-    # caller, including tests, must now decide the path explicitly.
+    # kill_switch_file and dream_state_path have NO default (Phase N5 audit
+    # finding F4, extended to dream_state_path by the Phase N7 audit's
+    # finding M1): a caller that omits either would previously fall back to
+    # the real production path (CONFIG.safety.kill_switch_file /
+    # CONFIG.dream.state_path). A backtest or parameter sweep that trips the
+    # daily-loss breaker (routine, at 0.5%-per-trade risk over any real
+    # drawdown) or completes a weekly dream cycle would then write LIVE
+    # state - halting the actual fund, or overwriting the real lessons file
+    # with a sweep cell's fabricated history. Every caller, including tests,
+    # must now decide both paths explicitly.
     kill_switch_file: str
+    dream_state_path: str
     account_currency: str = "USD"
-    dream_state_path: str = ""
     poll_interval_seconds: int = 30
 
 
@@ -97,10 +109,31 @@ class FundStateActor(Actor):
         self._drawdown_mult = 1.0
         self._start_of_day_equity: float | None = None
         self._day: object | None = None
-        self.dream_state = dream_mod.load(config.dream_state_path or None)
+        self._closed_pnls: list[tuple[int, float]] = []  # (ts_closed_ns, realized_pnl)
+        self.dream_state = dream_mod.load(config.dream_state_path)
         self.journal = journal or Journal(CONFIG.journal_path)
         self.committee = committee
         self.alerter = alerter or Alerter.from_env()
+
+    # -- realized P&L accumulator ---------------------------------------------
+    def record_realized_pnl(self, realized_pnl: float, ts_ns: int) -> None:
+        """Called directly by each ``WitStrategy.on_position_closed`` -
+        ``Cache.positions_closed()`` cannot be used for this (Phase N7 audit
+        findings C1/C2). Under ``OmsType.NETTING`` - the only OMS this system
+        runs, hard-coded by the IBKR execution client - Nautilus derives
+        ``position_id`` as a constant ``f"{instrument_id}-{strategy_id}"``,
+        and re-entering a symbol evicts its prior closed position from
+        ``Cache``'s closed-position index (confirmed against the installed
+        adapter/cache sources and by executing a real multi-trade backtest -
+        both the daily-loss breaker and the reflection/dream P&L pipeline
+        read 0.0 / nothing after real closed trades). This accumulator is
+        fed once per genuine round trip, in ``WitStrategy``'s own real-time
+        event, and never gets evicted."""
+        self._closed_pnls.append((ts_ns, realized_pnl))
+        cutoff_ns = int(
+            (self.clock.utc_now() - timedelta(days=_PNL_RETENTION_DAYS)).timestamp() * 1_000_000_000
+        )
+        self._closed_pnls = [(ts, pnl) for ts, pnl in self._closed_pnls if ts >= cutoff_ns]
 
     # -- lifecycle -----------------------------------------------------------
     def on_start(self) -> None:
@@ -144,8 +177,16 @@ class FundStateActor(Actor):
         )
 
     def on_stop(self) -> None:
-        for name in ("fund_state_poll", "daily_briefing", "daily_review", "weekly_dream"):
-            self.clock.cancel_timer(name)
+        # No manual timer teardown here (Phase N7 audit finding L1):
+        # Actor._stop() already calls self._clock.cancel_timers()
+        # unconditionally right after on_stop() returns
+        # (nautilus_trader/common/actor.pyx, confirmed against the installed
+        # source). A by-name loop here adds nothing and adds a failure mode
+        # instead - Clock.cancel_timer(name) raises KeyError on an unknown
+        # name, so if on_start ever raised partway through registering the
+        # four timers, this loop would mask the real startup error with a
+        # KeyError during shutdown.
+        pass
 
     def _on_poll_timer(self, event) -> None:
         self._poll_once()
@@ -177,9 +218,7 @@ class FundStateActor(Actor):
         opened each closed trade. A failure here must not take down the
         trading strategies, so it only logs."""
         try:
-            since = self.clock.utc_now() - timedelta(days=1)
-            pnl_map = dream_mod.pnl_by_position(self.cache, since)
-            review = Reflection(self.journal).review(pnl_map, days=1)
+            review = Reflection(self.journal).review(days=1, now=self.clock.utc_now())
             self.alerter.send(Reflection.format(review))
         except Exception as e:  # noqa: BLE001 - a review outage must not halt trading
             self.journal.log_event("review_error", f"{type(e).__name__}: {e}")
@@ -194,15 +233,12 @@ class FundStateActor(Actor):
             self.journal.log_event("dream_skipped", "no dream-capable committee configured")
             return
         try:
-            # self.config.dream_state_path, not CONFIG.dream.state_path
-            # directly - same reasoning as kill_switch_file having no
-            # fallback default (Phase N5 audit finding F4): a caller that
-            # deliberately set a non-default dream_state_path (every test,
-            # every backtest/sweep) must not have this timer silently write
-            # the real production dream_state.json instead.
-            dream_cfg = replace(CONFIG.dream,
-                               state_path=self.config.dream_state_path or CONFIG.dream.state_path)
-            state = dream_mod.run(self.committee, self.cache, self.journal, dream_cfg,
+            # self.config.dream_state_path - required, no fallback default
+            # (Phase N7 audit finding M1) - so this always writes/reads the
+            # path this specific actor was deliberately configured with,
+            # never CONFIG.dream.state_path's production default.
+            dream_cfg = replace(CONFIG.dream, state_path=self.config.dream_state_path)
+            state = dream_mod.run(self.committee, self.journal, dream_cfg,
                                   now=self.clock.utc_now())
             self.dream_state = state
             self.alerter.send(dream_mod.format_digest(state))
@@ -254,30 +290,19 @@ class FundStateActor(Actor):
             return None
 
     def _realized_pnl_since(self, since_ns: int) -> float:
-        """Sum of closed-position realized P&L (incl. commissions) since
-        ``since_ns`` - Portfolio.equity() is NOT used for this (Phase N5 audit
-        finding F1): for a margin account it's documented as
-        ``balance.total + sum(unrealized_pnl(open positions))``, so an equity
-        delta conflates open-position mark-to-market with realized P&L. MT5's
-        SafetyMonitor breaker reads strictly realized closed P&L
-        (``broker.closed_pnl_since``); this is that same measurement over
-        Nautilus's own closed-position cache.
-
-        No ``venue=`` filter here (Phase N6 audit finding F3): ``Cache``
-        indexes positions by *instrument* venue (``NVDA.NASDAQ``,
-        ``EUR/USD.IDEALPRO``, ...), never by the account's own pseudo-venue
-        (``self.config.venue`` — IB's ``IB_VENUE``). Filtering by the account
-        venue here made this query return empty unconditionally, so the
-        breaker computed 0.0 realized P&L forever and could never latch.
-        Unfiltered is correct for the single-executor rule this system
-        already runs under: one `FundStateActor` per broker connection, so
-        every closed position in the cache belongs to this account regardless
-        of which instrument venue it traded on."""
-        total = 0.0
-        for pos in self.cache.positions_closed():
-            if pos.ts_closed is not None and pos.ts_closed >= since_ns and pos.realized_pnl is not None:
-                total += float(pos.realized_pnl)
-        return total
+        """Sum of realized P&L (incl. commissions) since ``since_ns``, from
+        ``self._closed_pnls`` (Phase N7 audit finding C2) - NOT from
+        ``self.cache.positions_closed()``, which the Phase N6 audit's finding
+        F3 fix (dropping a ``venue=`` filter) made non-empty but did not make
+        complete. Under ``OmsType.NETTING``, ``Cache`` can hold at most one
+        closed position per instrument - it is overwritten and evicted from
+        the closed index the instant that instrument is re-entered
+        (confirmed against the installed ``cache.pyx`` and by executing a
+        real multi-trade backtest: after fourteen completed round trips on
+        one symbol, this query still returned 0.0). ``record_realized_pnl``
+        is fed once per genuine closure and never evicted, so the breaker
+        can now actually observe a day's real cumulative loss."""
+        return sum(pnl for ts, pnl in self._closed_pnls if ts >= since_ns)
 
     def _recompute_multipliers(self) -> None:
         acfg = CONFIG.adaptive
@@ -328,16 +353,15 @@ class FundStateActor(Actor):
         # returns 1.0 (no effect) whenever use_fractional_kelly is off or the
         # sample is under kelly_min_trades, so this is a strict superset of
         # the prior hard-coded 1.0 when the feature flag stays at its
-        # default. Unfiltered positions_closed(), same reasoning as
-        # _realized_pnl_since above: one FundStateActor per broker account.
+        # default. Reads self._closed_pnls, not cache.positions_closed() -
+        # same reasoning as _realized_pnl_since above (Phase N7 audit finding
+        # H2: under NETTING the cache can hold at most one closed position
+        # per instrument, so an 8-symbol watchlist could never reach
+        # kelly_min_trades=30 regardless of how much real history existed).
         lookback_ns = int(
             (now - timedelta(days=acfg.kelly_lookback_days)).timestamp() * 1_000_000_000
         )
-        pnls = [
-            float(pos.realized_pnl) for pos in self.cache.positions_closed()
-            if pos.ts_closed is not None and pos.ts_closed >= lookback_ns
-            and pos.realized_pnl is not None
-        ]
+        pnls = [pnl for ts, pnl in self._closed_pnls if ts >= lookback_ns]
         self._kelly_mult = adaptive.kelly_multiplier(
             adaptive.kelly_stats(pnls), CONFIG.risk.risk_per_trade, acfg,
         )

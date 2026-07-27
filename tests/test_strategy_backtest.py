@@ -226,7 +226,7 @@ class _FakeDreamCommittee:
         return []
 
 
-def test_daily_and_weekly_timers_fire_during_a_multi_day_backtest(tmp_path):
+def test_daily_and_weekly_timers_fire_during_a_multi_day_backtest(tmp_path, capsys):
     """make_bars()'s 150 H1 bars start 2026-01-01 (Thursday) and span ~6
     days, crossing Sunday 2026-01-04 - long enough for every one of the
     three Phase N7 cron-equivalents (daily briefing 00:05 UTC, daily review
@@ -302,21 +302,25 @@ def test_daily_and_weekly_timers_fire_during_a_multi_day_backtest(tmp_path):
     assert "briefing_error" not in kinds, "daily briefing raised - see the journal for the traceback"
     assert "dream_error" not in kinds, "weekly dream raised - see the journal for the traceback"
 
+    # Positive signal, not just error-absence (Phase N7 audit finding I1):
+    # briefing/review only print (via Alerter.send) rather than journalling
+    # on success, so "no *_error kind" alone can't distinguish "fired
+    # cleanly" from "never fired at all". Both must actually have printed
+    # at least once over six simulated days.
+    out = capsys.readouterr().out
+    assert out.count("Daily briefing") >= 1, "daily briefing timer never printed its output"
+    assert out.count("Reflection") >= 1, "daily review timer never printed its output"
 
-def test_fractional_kelly_does_not_crash_across_a_multi_trade_backtest(tmp_path, monkeypatch):
-    """Smoke test for the Kelly wiring landed in Phase N7
-    (FundStateActor._recompute_multipliers): enabling it must not crash even
-    though the pure math in wit/risk/adaptive.py is already covered
-    directly. Uses the shared StubPolicyProvider (always BUY) over 150 bars
-    so multiple positions open and close, giving kelly_stats() a non-empty
-    sample."""
-    import wit.nautilus.actor as actor_module
-    from wit.config import AdaptiveConfig, Config
 
-    monkeypatch.setattr(actor_module, "CONFIG",
-                        Config(adaptive=AdaptiveConfig(use_fractional_kelly=True,
-                                                        kelly_min_trades=1)))
+# ── Phase N7 audit findings C1/C2/H2: NETTING re-entry evicts a symbol's
+# prior closed position from Cache - proven here against a real multi-trade
+# backtest, the same way the bugs themselves were originally caught. ────────
 
+def _run_multi_trade_backtest(tmp_path, *, kill_switch_file=None, actor_kwargs=None):
+    """Shared setup: 400 H1 bars (long enough for several real round trips -
+    the 150-bar fixture other tests use rarely closes more than one or two),
+    StubPolicyProvider always BUY, a real FundStateActor + WitStrategy pair.
+    Returns (fund_state, journal, closed_pnls_from_journal)."""
     instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")
     venue = instrument.id.venue
     engine = BacktestEngine(BacktestEngineConfig(logging=LoggingConfig(bypass_logging=True)))
@@ -326,7 +330,7 @@ def test_fractional_kelly_does_not_crash_across_a_multi_trade_backtest(tmp_path,
     )
     engine.add_instrument(instrument)
     bar_type = BarType.from_str(f"{instrument.id}-1-HOUR-LAST-EXTERNAL")
-    frame = make_bars(n=150, drift=0.0005, seed=7)
+    frame = make_bars(n=400, drift=0.0005, seed=7)
     engine.add_data(_make_nautilus_bars(bar_type, instrument, frame))
     engine.add_data(_make_nautilus_quotes(instrument, frame))
 
@@ -335,11 +339,11 @@ def test_fractional_kelly_does_not_crash_across_a_multi_trade_backtest(tmp_path,
     fund_state = FundStateActor(
         FundStateActorConfig(
             venue=venue, account_currency="USD",
-            kill_switch_file=str(tmp_path / "KILL"),
+            kill_switch_file=str(kill_switch_file or tmp_path / "KILL"),
             dream_state_path=str(tmp_path / "dream_state.json"),
             poll_interval_seconds=3600,
         ),
-        journal=journal,
+        journal=journal, **(actor_kwargs or {}),
     )
     strategy = WitStrategy(
         WitStrategyConfig(instrument_id=instrument.id, bar_type=bar_type, symbol="EURUSD",
@@ -349,9 +353,79 @@ def test_fractional_kelly_does_not_crash_across_a_multi_trade_backtest(tmp_path,
     )
     engine.add_actor(fund_state)
     engine.add_strategy(strategy)
-
     engine.run()
-    kelly_mult, _drawdown_mult = fund_state.size_multipliers()
     engine.dispose()
 
-    assert 0.0 < kelly_mult, "kelly_multiplier() must always return a positive multiplier"
+    import json
+    journal_pnls = [
+        r["realized_pnl"] for r in
+        (json.loads(line) for line in Path(journal.path).read_text(encoding="utf-8").splitlines()
+         if line.strip())
+        if r.get("kind") == "position_closed"
+    ]
+    return fund_state, journal, journal_pnls
+
+
+def test_realized_pnl_since_sums_every_closed_trade_not_just_the_last(tmp_path):
+    """Phase N7 audit finding C2: under OmsType.NETTING, Cache holds at most
+    one closed position per instrument - _realized_pnl_since used to read
+    0.0 after any number of real closed trades on one symbol. Proven here by
+    running a real multi-trade backtest and checking the actor's own
+    accumulator against the journal's independent record of every close."""
+    fund_state, _journal, journal_pnls = _run_multi_trade_backtest(tmp_path)
+
+    assert len(journal_pnls) >= 3, (
+        f"need several real closed trades to prove summation, got {len(journal_pnls)} - "
+        "widen the bar window if this becomes flaky"
+    )
+    assert fund_state._realized_pnl_since(0) == sum(journal_pnls)
+
+
+def test_daily_loss_breaker_latches_after_multiple_closed_trades(tmp_path, monkeypatch):
+    """Phase N7 audit finding C2's failure scenario, reproduced directly: a
+    cap tight enough that a single ordinary loss breaches it, so the
+    breaker either latches on real accumulated loss or it doesn't work at
+    all - there is no plausible pass-by-accident here."""
+    import wit.nautilus.actor as actor_module
+    from wit.config import Config, RiskConfig
+
+    monkeypatch.setattr(actor_module, "CONFIG",
+                        Config(risk=RiskConfig(max_daily_loss=0.0001)))  # $5 on $50k equity
+
+    kill_switch = tmp_path / "KILL"
+    _fund_state, _journal, journal_pnls = _run_multi_trade_backtest(
+        tmp_path, kill_switch_file=kill_switch,
+    )
+
+    assert any(pnl < 0 for pnl in journal_pnls), (
+        "test setup assumption failed: no losing trade occurred to prove the breaker against"
+    )
+    assert kill_switch.exists(), (
+        "daily-loss breaker never latched despite a real realized loss past the cap"
+    )
+
+
+def test_fractional_kelly_reads_the_real_accumulated_sample(tmp_path, monkeypatch):
+    """Phase N7 audit finding H2: the only prior test asserted
+    `0.0 < kelly_mult`, which every reachable return value of
+    kelly_multiplier() satisfies unconditionally - it could not have caught
+    the sample being permanently empty. This pins the actual sample size
+    against the journal's independent count, and requires a non-1.0
+    multiplier (kelly_min_trades=1 and a real, non-degenerate P&L mix make
+    a bare 1.0 no-op implausible unless the sample were empty)."""
+    import wit.nautilus.actor as actor_module
+    from wit.config import AdaptiveConfig, Config
+
+    monkeypatch.setattr(actor_module, "CONFIG",
+                        Config(adaptive=AdaptiveConfig(use_fractional_kelly=True,
+                                                        kelly_min_trades=1)))
+
+    fund_state, _journal, journal_pnls = _run_multi_trade_backtest(tmp_path)
+    kelly_mult, _drawdown_mult = fund_state.size_multipliers()
+
+    assert len(fund_state._closed_pnls) == len(journal_pnls) > 0, (
+        "the actor's own accumulator must match the journal's independent count of closed trades"
+    )
+    assert kelly_mult != 1.0, (
+        "kelly_mult stayed at the disabled/empty-sample default despite a real accumulated sample"
+    )

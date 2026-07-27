@@ -5,8 +5,6 @@ a real ``TradingNode`` and belong to Phase N9's attended gate.
 """
 from __future__ import annotations
 
-import json
-
 from wit import cli
 
 
@@ -92,7 +90,10 @@ def test_review_prints_reflection_summary(tmp_path, monkeypatch, capsys):
     assert "Reflection" in capsys.readouterr().out
 
 
-def test_review_loads_pnl_from_json_file(tmp_path, monkeypatch, capsys):
+def test_review_scores_a_completed_round_trip_from_the_journal_alone(tmp_path, monkeypatch, capsys):
+    """Phase N7 audit finding C1: review no longer needs an external P&L
+    source (the removed --pnl-json) - Reflection.review() reads realized
+    P&L straight from the journal's own position_closed events."""
     from dataclasses import dataclass as dc
 
     from wit.config import Config, SafetyConfig
@@ -119,14 +120,10 @@ def test_review_loads_pnl_from_json_file(tmp_path, monkeypatch, capsys):
     journal = Journal(str(journal_path))
     journal.log_decision("NVDA", _D(), _P(), _R(),
                          order={"ok": True, "client_order_id": "O-1"}, client_order_id="O-1")
-    journal.log_event("order_filled", "fill", symbol="NVDA",
-                      client_order_id="O-1", position_id="P-1")
+    journal.log_event("position_closed", "realized_pnl=88.0", symbol="NVDA",
+                      position_id="NVDA.SIM-Strategy-000", realized_pnl=88.0)
 
-    pnl_path = tmp_path / "pnl.json"
-    pnl_path.write_text(json.dumps({"P-1": 88.0}), encoding="utf-8")
-
-    cli.cmd_review(cli.build_parser().parse_args(
-        ["review", "--pnl-json", str(pnl_path)]))
+    cli.cmd_review(cli.build_parser().parse_args(["review"]))
     out = capsys.readouterr().out
     assert "88.00" in out or "+88.00" in out
 

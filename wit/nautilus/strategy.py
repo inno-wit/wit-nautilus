@@ -368,7 +368,22 @@ class WitStrategy(Strategy):
         )
 
     def on_position_closed(self, event) -> None:
+        # realized_pnl is now a structured field, not just embedded in the
+        # message string (Phase N7 audit finding C1/M3): Reflection.review()
+        # reads it directly, since under OmsType.NETTING - the only OMS this
+        # system runs (the IBKR exec client hard-codes it) - position_id is
+        # a constant per (instrument, strategy), not a trade identifier, and
+        # Cache.positions_closed() evicts a symbol's prior closed position
+        # the moment it's re-entered. This event, journalled once per real
+        # round trip as it happens, is the only complete record.
+        realized_pnl = float(event.realized_pnl)
         self.journal.log_event(
-            "position_closed", f"realized_pnl={event.realized_pnl}",
+            "position_closed", f"realized_pnl={realized_pnl}",
             symbol=self.config.symbol, position_id=str(event.position_id),
+            realized_pnl=realized_pnl,
         )
+        # Same reasoning feeds the daily-loss breaker and Kelly sizing
+        # directly (Phase N7 audit finding C2/H2): FundStateActor's own
+        # accumulator, not a cache query that the same NETTING eviction
+        # would starve of history.
+        self.fund_state.record_realized_pnl(realized_pnl, event.ts_closed)

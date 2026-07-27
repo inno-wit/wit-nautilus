@@ -6,7 +6,11 @@ hallucinated ones. The digest is also what the risk engine reads ATR from.
 
 Ported verbatim from ``Wit-Hedge-fund/engine/signals/technicals.py`` (Phase N2).
 Gate: byte-identical ``Technicals``/``as_prompt_block()`` output vs. the MT5
-build on the same input DataFrame.
+build on the same input DataFrame - with one deliberate divergence, added in
+Phase N7: the MT5 build's RSI returns a bare NaN on a zero-loss window
+(never actually reached JSON there), which this build clamps to a real
+Wilder-RSI value (100.0 rising / 50.0 flat - see ``_rsi``'s own docstring)
+instead, since a NaN silently breaks any non-Python journal reader.
 """
 from __future__ import annotations
 
@@ -52,17 +56,24 @@ def _rsi(close: pd.Series, period: int = 14) -> float:
     delta = close.diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
+    last_gain = float(gain.iloc[-1])
     last_loss = float(loss.iloc[-1])
     if last_loss == 0:
-        # No losses anywhere in the window (a constant or monotonically
-        # rising tape) - RS is a division by zero, not a real extreme to
-        # report. Clamp to neutral rather than emit a bare NaN: a bare NaN
-        # isn't valid JSON (RFC 8259), and QuantAnalystReport.to_dict() ->
-        # Journal.write() used to write it straight to JSONL, silently
-        # breaking any non-Python reader (jq, JSON.parse). Owed from the
-        # Phase N2 audit's finding F2; wired up in Phase N7.
-        return 50.0
-    rs = float(gain.iloc[-1]) / last_loss
+        # No losses anywhere in the window - RS is a division by zero, not
+        # a real value, but the two ways to get here are not the same
+        # reading (Phase N7 audit finding M2): a monotonically *rising*
+        # tape (last_gain > 0) is Wilder's actual maximally-overbought
+        # case - RSI is 100 as rs -> infinity, the mirror image of the
+        # already-correct pure-downtrend path below, which returns 0.0.
+        # Only a truly flat tape (last_gain == 0 too - delta is 0
+        # throughout) has no direction to report, and is genuinely 50.0.
+        # Both are real Wilder-RSI values, not the NaN placeholder this
+        # replaced (owed from the Phase N2 audit's finding F2: a bare NaN
+        # isn't valid JSON, RFC 8259, and broke any non-Python journal
+        # reader) - fixing that must not trade one silent wrong value for
+        # another.
+        return 50.0 if last_gain == 0 else 100.0
+    rs = last_gain / last_loss
     return 100 - 100 / (1 + rs)
 
 

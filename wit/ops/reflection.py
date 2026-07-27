@@ -9,20 +9,35 @@ Deliberately statistics-first: it reports edge by symbol, Markov regime, vol
 regime and conviction bucket. No LLM is required to produce it.
 
 Ported from ``Wit-Hedge-fund/engine/reflection.py`` (Phase N7). The join key
-changes: the MT5 build had one broker-side ticket per order, so
-``review()`` took ``deals_by_ticket: dict[int, float]`` straight from the
-broker and matched it against ``rec["order"]["ticket"]``. Nautilus positions
-are not identified at decision time - a decision's journal record carries
-only ``client_order_id`` (the entry order), and the ``position_id`` a fill
-creates is only known once ``on_order_filled`` fires, asynchronously, after
-the committee has already returned its verdict (see
-``wit/nautilus/strategy.py``'s ``_on_decision``/``on_order_filled``). So the
-join here is two-step instead of one: resolve each decision's
-``client_order_id`` to a ``position_id`` via the ``order_filled`` events in
-the same journal, then look that position up in the caller-supplied
-``pnl_by_position`` (built from ``cache.positions_closed()`` - see
-``wit/ops/dream.py``'s ``run()``). The aggregation logic itself (win rate by
-symbol/regime/vol-regime/conviction) is unchanged.
+changes twice over this port's history, and the second change is the one
+that actually works:
+
+1. The MT5 build had one broker-side ticket per order, so ``review()`` took
+   ``deals_by_ticket: dict[int, float]`` straight from the broker.
+2. N7's first cut resolved a decision's ``client_order_id`` to a Nautilus
+   ``position_id`` (via the journal's own ``order_filled`` events) and
+   looked that up in a caller-supplied ``pnl_by_position`` dict built from
+   ``cache.positions_closed()``. **This does not work** (Phase N7 audit
+   finding C1, proven by executing a real multi-trade backtest, not by
+   inspection): under ``OmsType.NETTING`` - the only OMS this system runs,
+   hard-coded by the IBKR execution client - Nautilus derives
+   ``position_id`` as the constant ``f"{instrument_id}-{strategy_id}"``, not
+   a per-trade identifier, and ``Cache`` evicts a symbol's prior closed
+   position from its closed-position index the instant that symbol is
+   re-entered. The join either found nothing, or silently scored every
+   decision on a symbol against whichever single trade happened to survive.
+
+This version needs no cache and no position id at all. ``WitStrategy``
+already journals a structured ``realized_pnl`` on every real
+``on_position_closed`` event (see that module), which - unlike ``Cache`` -
+is never evicted; it is simply appended to the journal once per genuine
+round trip, in order. Since ``RiskConfig.per_symbol_max_positions = 1``
+means a symbol can only ever have one position open at a time, its
+entries (executed decisions) and its closes (``position_closed`` events)
+must alternate strictly in journal order - so the *n*-th executed decision
+on a symbol pairs with the *n*-th close on that same symbol, with no id
+needed to prove it. The aggregation logic itself (win rate by
+symbol/regime/vol-regime/conviction) is unchanged from the MT5 build.
 """
 from __future__ import annotations
 
@@ -55,19 +70,18 @@ class Bucket:
         }
 
 
-def _position_by_client_order_id(entries: list[dict[str, Any]]) -> dict[str, str]:
-    """The entry fill links a decision's ``client_order_id`` to the
-    ``position_id`` it opened. Only the *first* fill recorded for a given
-    ``client_order_id`` is kept - that's the entry; a bracket's SL/TP legs
-    fill under their own, different ``client_order_id`` and never appear
-    here as a key."""
-    out: dict[str, str] = {}
+def _closed_trades_by_symbol(entries: list[dict[str, Any]]) -> dict[str, list[float]]:
+    """Realized P&L per symbol, in journal (chronological) order, from
+    ``WitStrategy.on_position_closed``'s own structured ``realized_pnl``
+    field - see this module's docstring for why that, and not
+    ``position_id``, is the join key."""
+    out: dict[str, list[float]] = defaultdict(list)
     for rec in entries:
-        if rec.get("type") != "event" or rec.get("kind") != "order_filled":
+        if rec.get("type") != "event" or rec.get("kind") != "position_closed":
             continue
-        coid, pid = rec.get("client_order_id"), rec.get("position_id")
-        if coid and pid and coid not in out:
-            out[coid] = pid
+        symbol, pnl = rec.get("symbol"), rec.get("realized_pnl")
+        if symbol and pnl is not None:
+            out[symbol].append(float(pnl))
     return out
 
 
@@ -79,18 +93,31 @@ class Reflection:
     def _conviction_bucket(c: float) -> str:
         return "0.0-0.3" if c < 0.3 else "0.3-0.6" if c < 0.6 else "0.6-1.0"
 
-    def review(self, pnl_by_position: dict[str, float], days: int = 7) -> dict[str, Any]:
-        """Join journaled decisions to realized P&L keyed by Nautilus
-        position id.
+    def review(self, days: int = 7, now: datetime | None = None) -> dict[str, Any]:
+        """Join journaled decisions to realized P&L by chronological
+        position within each symbol (see this module's docstring for why).
 
-        ``pnl_by_position`` maps a closed position's id to its realized P&L;
-        the caller supplies it from ``cache.positions_closed()`` (see
-        ``wit/ops/dream.py``'s ``run()``), so this module stays independent
-        of Nautilus's own types.
+        ``now`` must be the caller's own clock, not a bare
+        ``datetime.now(UTC)`` default (Phase N7 audit finding H1, the same
+        N5 F1/F3 bug class): ``FundStateActor``'s daily-timer callback runs
+        on simulated time in a backtest, potentially months away from
+        wall-clock "now" - without an explicit ``now``, every "last N days"
+        window there degenerates to "everything the journal has ever
+        recorded", proven by a real multi-day backtest reporting a
+        monotonically growing decision count from a nominal 1-day window.
+
+        Note: a decision entered just before the window boundary whose
+        closing trade lands just after it will misalign this symbol's FIFO
+        pairing by one trade for this window only - an inherent edge of any
+        sliding-window join over an append-only log, self-correcting on the
+        next call. Not the same failure mode as C1 (which corrupted every
+        trade, every window, permanently).
         """
-        since = datetime.now(UTC) - timedelta(days=days)
+        now = now or datetime.now(UTC)
+        since = now - timedelta(days=days)
         entries = self.journal.entries_since(since)
-        position_by_coid = _position_by_client_order_id(entries)
+        closed_by_symbol = _closed_trades_by_symbol(entries)
+        cursor: dict[str, int] = defaultdict(int)
 
         overall = Bucket()
         by_symbol: dict[str, Bucket] = defaultdict(Bucket)
@@ -104,20 +131,22 @@ class Reflection:
                 continue
             considered += 1
             order = rec.get("order") or {}
-            coid = rec.get("client_order_id") or order.get("client_order_id")
-            if not (order.get("ok") and coid):
+            if not order.get("ok"):
                 continue
-            position_id = position_by_coid.get(coid)
-            if position_id is None or position_id not in pnl_by_position:
-                continue
+            symbol = rec["symbol"]
+            closes = closed_by_symbol.get(symbol, [])
+            idx = cursor[symbol]
+            if idx >= len(closes):
+                continue  # this position hasn't closed yet (still open, or outside the window)
+            pnl = closes[idx]
+            cursor[symbol] = idx + 1
 
             executed += 1
-            pnl = pnl_by_position[position_id]
             quant = rec.get("quant", {})
             committee = rec.get("committee", {})
 
             overall.add(pnl)
-            by_symbol[rec["symbol"]].add(pnl)
+            by_symbol[symbol].add(pnl)
             by_regime[quant.get("markov", {}).get("regime", "?")].add(pnl)
             by_vol_regime[quant.get("garch", {}).get("vol_regime", "?")].add(pnl)
             by_conviction[

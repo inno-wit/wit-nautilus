@@ -23,9 +23,15 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from wit.config import CONFIG
+
+# wit dream's default state path when --state-path is omitted (Phase N7
+# audit finding L2) - never CONFIG.dream.state_path, the real production
+# file a manual/exploratory invocation must not silently overwrite.
+_SCRATCH_DREAM_STATE_PATH = str(Path(CONFIG.journal_path).parent / "dream_state.manual.json")
 
 
 def cmd_version(_: argparse.Namespace) -> int:
@@ -125,22 +131,16 @@ def cmd_status(_: argparse.Namespace) -> int:
 
 
 def cmd_review(args: argparse.Namespace) -> int:
-    """Score journaled decisions vs. realized P&L. Needs a source of closed-
-    position P&L - `--pnl-json` accepts a `{position_id: realized_pnl}` file
-    (e.g. exported from `wit status` once live, or hand-built for a dry
-    run); without it, every decision is considered but none can be scored,
-    since Reflection has no P&L to join against."""
-    import json
-
+    """Score journaled decisions vs. realized P&L. Reflection reads realized
+    P&L straight from the journal's own ``position_closed`` events (Phase N7
+    audit finding C1 - no external P&L source needed, and none would be
+    correct: Nautilus's ``position_id`` isn't a trade identifier under
+    ``OmsType.NETTING``, the only OMS this system runs)."""
     from wit.ops.journal import Journal
     from wit.ops.reflection import Reflection
 
-    pnl_by_position: dict[str, float] = {}
-    if args.pnl_json:
-        pnl_by_position = json.loads(Path(args.pnl_json).read_text(encoding="utf-8"))
-
     journal = Journal(CONFIG.journal_path)
-    text = Reflection.format(Reflection(journal).review(pnl_by_position, days=args.days))
+    text = Reflection.format(Reflection(journal).review(days=args.days))
     if args.telegram:
         from wit.ops.alerts import Alerter
         Alerter.from_env().send(text)
@@ -149,45 +149,30 @@ def cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
-class _StaticPosition:
-    """Enough of a Nautilus ``Position`` for ``dream.pnl_by_position`` to
-    read - used only by ``wit dream``'s manual, no-node invocation."""
-
-    def __init__(self, id: str, ts_closed: int, realized_pnl: float) -> None:
-        self.id = id
-        self.ts_closed = ts_closed
-        self.realized_pnl = realized_pnl
-
-
-class _StaticCache:
-    def __init__(self, pnl_by_position: dict[str, float]) -> None:
-        from datetime import UTC, datetime
-        now_ns = int(datetime.now(UTC).timestamp() * 1_000_000_000)
-        self._positions = [_StaticPosition(pid, now_ns, pnl)
-                          for pid, pnl in pnl_by_position.items()]
-
-    def positions_closed(self) -> list[_StaticPosition]:
-        return self._positions
-
-
 def cmd_dream(args: argparse.Namespace) -> int:
     """Manually fire the weekly self-review (also runs automatically on
     FundStateActor's own timer while a node is running - see `wit paper`).
-    Needs the same P&L source as `review`."""
-    import json
-
-    from wit.committee.live import LiveCommitteeProvider
+    ``--state-path`` defaults to a scratch file, not the real production
+    `data/dream_state.json` (Phase N7 audit finding L2/M1): a manual
+    invocation - the kind of thing run to sanity-check the journal - must
+    not silently overwrite the fund's live lessons file. Pass
+    `--state-path` explicitly (e.g. `CONFIG.dream.state_path`) to update
+    production deliberately."""
     from wit.ops import dream
     from wit.ops.journal import Journal
 
-    pnl_by_position: dict[str, float] = {}
-    if args.pnl_json:
-        pnl_by_position = json.loads(Path(args.pnl_json).read_text(encoding="utf-8"))
+    try:
+        from wit.committee.live import LiveCommitteeProvider
+        committee = LiveCommitteeProvider()
+    except ValueError as e:
+        print(f"Cannot run the dream cycle: {e}")
+        return 1
 
     journal = Journal(CONFIG.journal_path)
-    committee = LiveCommitteeProvider()
-    state = dream.run(committee, _StaticCache(pnl_by_position), journal, CONFIG.dream)
+    cfg = replace(CONFIG.dream, state_path=args.state_path or _SCRATCH_DREAM_STATE_PATH)
+    state = dream.run(committee, journal, cfg)
     print(dream.format_digest(state))
+    print(f"\n(state written to {cfg.state_path})")
     return 0
 
 
@@ -236,13 +221,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_review = sub.add_parser("review", help="score journaled decisions vs realized P&L")
     p_review.add_argument("--days", type=int, default=7)
-    p_review.add_argument("--pnl-json", help="path to a {position_id: realized_pnl} JSON file")
     p_review.add_argument("--telegram", action="store_true",
                           help="send the summary to Telegram instead of just printing it")
     p_review.set_defaults(func=cmd_review)
 
     p_dream = sub.add_parser("dream", help="manually run the weekly self-review")
-    p_dream.add_argument("--pnl-json", help="path to a {position_id: realized_pnl} JSON file")
+    p_dream.add_argument("--state-path",
+                         help="where to write dream state (defaults to a scratch file, "
+                              "never the production data/dream_state.json)")
     p_dream.set_defaults(func=cmd_dream)
 
     sub.add_parser("paper", help="boot the live paper-trading node (blocks until stopped)") \
