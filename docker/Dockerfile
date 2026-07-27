@@ -15,7 +15,16 @@ RUN pip install --no-cache-dir ".[ib]"
 # docker-group user docs/BUILD_PLAN.md's Phase N8 section asks for on the host) — this
 # process only ever initiates outbound connections (Anthropic, IB Gateway, yfinance/
 # Finnhub) and publishes no ports, so it has no legitimate reason to run as root.
-RUN useradd --create-home --uid 1000 wit && \
+#
+# FUND_UID must match the deploy user's real uid (`id -u`) on the VPS (Phase N8 audit
+# finding M2), passed via compose.yml's build.args - ../data is a bind mount, so it
+# carries the HOST's ownership at runtime; the build-time chown below only sets ownership
+# inside the image layer, which a bind mount then shadows. A uid mismatch means the `wit`
+# user can't write data/ at all, including the kill switch - a safety mechanism that
+# can't write its own halt file because of a uid mismatch is worse than none, since it
+# looks like it's there.
+ARG FUND_UID=1000
+RUN useradd --create-home --uid ${FUND_UID} wit && \
     mkdir -p /app/data && chown -R wit:wit /app
 USER wit
 
@@ -25,11 +34,13 @@ ENTRYPOINT ["wit"]
 # accidentally boots a connected trading node - compose.yml overrides this explicitly.
 CMD ["doctor"]
 
-# `wit status` only, never `wit doctor`: doctor makes a real Anthropic API call when a
-# key is present, which a HEALTHCHECK firing every 60s would turn into an unbounded,
-# silently-billed background API load. status reads only local files (kill switch,
-# config) - proves the process/image is alive, not that trading is healthy. compose.yml's
-# fund service overrides CMD to ["paper"]; this HEALTHCHECK runs unmodified regardless, as
-# a distinct process alongside that foreground one.
-HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
-    CMD wit status || exit 1
+# `wit healthcheck`, not `wit status` or `wit doctor` (Phase N8 audit finding I2): status
+# always exits 0 regardless of whether the node is trading, halted, or hung, so it can
+# only detect a broken Python interpreter; doctor makes a real Anthropic API call when a
+# key is present, and a HEALTHCHECK firing every 60s would turn that into unbounded,
+# silently-billed background API load. healthcheck instead checks the freshness of a
+# heartbeat file FundStateActor's poll loop touches every cycle - a real liveness signal,
+# still with no network call. compose.yml's fund service overrides CMD to ["paper"]; this
+# HEALTHCHECK runs unmodified regardless, as a distinct process alongside that foreground one.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
+    CMD wit healthcheck || exit 1

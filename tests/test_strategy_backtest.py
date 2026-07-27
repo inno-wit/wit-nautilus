@@ -23,7 +23,7 @@ second init entirely and all three tests pass together reliably.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -515,7 +515,7 @@ def _run_staleness_backtest(tmp_path, *, bars_n: int = 100, quotes_n: int = 150,
         FundStateActorConfig(
             venue=venue, kill_switch_file=str(tmp_path / "KILL"),
             dream_state_path=str(tmp_path / "dream_state.json"),
-            watched_bar_types=(str(bar_type),), bar_interval_seconds=3600,
+            watched_bar_types={"EURUSD": str(bar_type)}, bar_interval_seconds=3600,
             stale_alert_multiplier=stale_alert_multiplier,
             stale_halt_multiplier=stale_halt_multiplier,
             poll_interval_seconds=poll_interval_seconds,
@@ -588,3 +588,169 @@ def test_staleness_watchdog_is_a_no_op_when_no_bar_types_are_watched(tmp_path):
     engine.dispose()
 
     assert not fund_state.is_halted()
+
+
+# ── Phase N8 audit findings C1/H2/M1 (round 9): session-aware staleness ────
+
+def _find_transition_hour(symbol: str, target_open: bool, start: datetime,
+                          search_hours: int = 400) -> int:
+    """The first hour offset from `start` at which
+    market_hours.is_session_open(symbol, ...) equals `target_open` -
+    computed against the real function rather than hand-derived from the
+    calendar, so these tests can't silently drift out of sync with it."""
+    from wit.config import CONFIG
+    from wit.ops import market_hours
+    for h in range(search_hours):
+        if market_hours.is_session_open(symbol, CONFIG.session, start + timedelta(hours=h)) == target_open:
+            return h
+    raise AssertionError(f"no {'open' if target_open else 'closed'} transition for {symbol} "
+                        f"within {search_hours}h of {start}")
+
+
+def _run_session_aware_staleness_backtest(tmp_path, *, symbol: str, bars_n: int, quotes_n: int,
+                                          poll_interval_seconds: int = 1800):
+    """Like _run_staleness_backtest, but lets the caller pick the watched
+    symbol (equity vs. FX) independently of the underlying Nautilus
+    instrument - _check_bar_staleness's session gating is driven entirely
+    by the watched_bar_types dict's string KEY, so feeding an FX-shaped
+    price series under an equity symbol like "NVDA" is a legitimate way to
+    exercise the equity-session branch without standing up a whole second
+    instrument/venue setup that would only ever be watched, never traded."""
+    instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")
+    venue = instrument.id.venue
+    engine = BacktestEngine(BacktestEngineConfig(logging=LoggingConfig(bypass_logging=True)))
+    engine.add_venue(venue=venue, oms_type=OmsType.NETTING, account_type=AccountType.MARGIN,
+                      base_currency=USD, starting_balances=[Money(50_000, USD)])
+    engine.add_instrument(instrument)
+    bar_type = BarType.from_str(f"{instrument.id}-1-HOUR-LAST-EXTERNAL")
+
+    full_frame = make_bars(n=quotes_n, drift=0.0, seed=7)
+    engine.add_data(_make_nautilus_bars(bar_type, instrument, full_frame.iloc[:bars_n]))
+    engine.add_data(_make_nautilus_quotes(instrument, full_frame))
+
+    from wit.ops.journal import Journal
+    fund_state = FundStateActor(
+        FundStateActorConfig(
+            venue=venue, kill_switch_file=str(tmp_path / "KILL"),
+            dream_state_path=str(tmp_path / "dream_state.json"),
+            watched_bar_types={symbol: str(bar_type)}, bar_interval_seconds=3600,
+            poll_interval_seconds=poll_interval_seconds,
+        ),
+        journal=Journal(str(tmp_path / "journal.jsonl")),
+    )
+    engine.add_actor(fund_state)
+    engine.run()
+    engine.dispose()
+    return fund_state
+
+
+def test_staleness_watchdog_does_not_halt_on_a_normal_overnight_equity_close(tmp_path):
+    """Phase N8 audit finding C1: a flat "bar age vs. a multiple of the
+    interval" rule with no market-hours awareness engages the kill switch
+    every single night on an RTH-only equity watchlist (~17.5h overnight
+    against a 6h default halt threshold) - reproduced by executing this
+    exact scenario. bars_n is the first hour NVDA's session is open (so at
+    least one real bar lands); quotes_n runs into the following day's open,
+    crossing one full overnight close."""
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    session_open_h = _find_transition_hour("NVDA", target_open=True, start=start)
+    next_close_h = session_open_h + _find_transition_hour(
+        "NVDA", target_open=False, start=start + timedelta(hours=session_open_h))
+    next_open_h = next_close_h + _find_transition_hour(
+        "NVDA", target_open=True, start=start + timedelta(hours=next_close_h))
+
+    fund_state = _run_session_aware_staleness_backtest(
+        tmp_path, symbol="NVDA", bars_n=session_open_h + 1, quotes_n=next_open_h + 2,
+    )
+
+    assert not fund_state.is_halted(), (
+        f"halted on a normal overnight close: {fund_state.halt_reason!r} "
+        f"(session_open_h={session_open_h}, next_close_h={next_close_h}, next_open_h={next_open_h})"
+    )
+
+
+def test_staleness_watchdog_does_not_halt_over_a_normal_fx_weekend(tmp_path):
+    """The FX-weekend half of C1: EURUSD closes Friday 17:00 ET through
+    Sunday 17:00 ET, ~48h - also past the 6h default halt threshold with
+    no session awareness."""
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    close_h = _find_transition_hour("EURUSD", target_open=False, start=start)
+    reopen_h = close_h + _find_transition_hour(
+        "EURUSD", target_open=True, start=start + timedelta(hours=close_h))
+
+    fund_state = _run_session_aware_staleness_backtest(
+        tmp_path, symbol="EURUSD", bars_n=close_h - 1, quotes_n=reopen_h + 2,
+    )
+
+    assert not fund_state.is_halted(), (
+        f"halted over a normal FX weekend: {fund_state.halt_reason!r} "
+        f"(close_h={close_h}, reopen_h={reopen_h})"
+    )
+
+
+def test_staleness_watchdog_still_catches_a_subscription_that_never_lands_a_first_bar(tmp_path):
+    """Phase N8 audit finding H2: a bar type that never delivers a first
+    bar used to be read as "still warming up" forever - the exact
+    "subscribed but no bars arriving, no error either" failure this
+    watchdog exists to catch. FX is open the entire simulated window here
+    (a Monday), so _quiet_since starts counting from actor start with no
+    session-closed gaps to (legitimately) explain the silence."""
+    instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")
+    venue = instrument.id.venue
+    engine = BacktestEngine(BacktestEngineConfig(logging=LoggingConfig(bypass_logging=True)))
+    engine.add_venue(venue=venue, oms_type=OmsType.NETTING, account_type=AccountType.MARGIN,
+                      base_currency=USD, starting_balances=[Money(50_000, USD)])
+    engine.add_instrument(instrument)
+    # Watch a DIFFERENT bar type than the one fed - simulates a malformed/
+    # phantom instrument id (the N6-F1 shape) that never resolves any data.
+    real_bar_type = BarType.from_str(f"{instrument.id}-1-HOUR-LAST-EXTERNAL")
+    never_fed_bar_type = f"{instrument.id}-1-MINUTE-MID-EXTERNAL"
+
+    frame = make_bars(n=20, drift=0.0, seed=7)
+    engine.add_data(_make_nautilus_bars(real_bar_type, instrument, frame))
+    engine.add_data(_make_nautilus_quotes(instrument, frame))
+
+    from wit.ops.journal import Journal
+    fund_state = FundStateActor(
+        FundStateActorConfig(
+            venue=venue, kill_switch_file=str(tmp_path / "KILL"),
+            dream_state_path=str(tmp_path / "dream_state.json"),
+            watched_bar_types={"EURUSD": never_fed_bar_type}, bar_interval_seconds=3600,
+            poll_interval_seconds=1800,
+        ),
+        journal=Journal(str(tmp_path / "journal.jsonl")),
+    )
+    engine.add_actor(fund_state)
+    engine.run()
+    engine.dispose()
+
+    assert fund_state.is_halted(), "a permanently-missing first bar must eventually be caught, not treated as forever-warming-up"
+
+
+def test_staleness_watchdog_alerts_without_halting_in_the_middle_band(tmp_path):
+    """Phase N8 audit finding M1: the original tests only ever ran silence
+    far past both thresholds, so inverting stale_alert_multiplier and
+    stale_halt_multiplier still passed every assertion. 4h of silence sits
+    strictly between the 2h alert and 6h halt defaults."""
+    fund_state, journal = _run_staleness_backtest(tmp_path, bars_n=100, quotes_n=104)
+
+    assert not fund_state.is_halted(), "4h of silence must not cross the 6h halt threshold"
+    assert fund_state._stale_symbols, "4h of silence must cross the 2h alert threshold"
+    kinds = [r.get("kind") for r in journal.read() if r.get("type") == "event"]
+    assert "bar_stale" in kinds
+    assert "bar_staleness_halt" not in kinds
+
+
+def test_staleness_watchdog_inverted_thresholds_do_not_pass_the_middle_band_test(tmp_path):
+    """The mutation-test check the audit performed by hand, now pinned as a
+    real assertion: swapping the two multipliers must break the test
+    above, or the two knobs still aren't proven apart."""
+    fund_state, _journal = _run_staleness_backtest(
+        tmp_path, bars_n=100, quotes_n=104,
+        stale_alert_multiplier=6.0, stale_halt_multiplier=2.0,
+    )
+    # With the multipliers inverted, 4h of silence now crosses the
+    # (inverted) 2h halt threshold - the fund must be halted, which would
+    # have failed test_staleness_watchdog_alerts_without_halting_in_the_middle_band's
+    # "not halted" assertion above.
+    assert fund_state.is_halted()

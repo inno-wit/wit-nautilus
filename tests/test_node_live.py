@@ -49,6 +49,25 @@ def test_paper_only_rejects_the_live_gateway_port(monkeypatch):
         node_live.assert_paper_only(live_port)
 
 
+def test_paper_only_accepts_the_dockerized_ib_gateway_paper_port(monkeypatch):
+    """Phase N8 audit finding H1: the ghcr.io/gnzsnz/ib-gateway image binds
+    its native 4002 to the container's own loopback only and republishes
+    on 0.0.0.0:4004 for other Compose containers to reach - 4004 is the
+    port `fund` actually connects to, and must be accepted."""
+    monkeypatch.setattr(node_live, "CONFIG", _config_with_paper_only(True))
+    dockerized = IBConfig(host="ib-gateway", port=4004, client_id=1, account_id="DUR305728")
+    node_live.assert_paper_only(dockerized)  # must not raise
+
+
+def test_paper_only_rejects_the_dockerized_ib_gateway_live_port(monkeypatch):
+    """4003 is 4004's live-account sibling on the same image - must stay
+    excluded exactly as deliberately as native 4001 is."""
+    monkeypatch.setattr(node_live, "CONFIG", _config_with_paper_only(True))
+    live_port = IBConfig(host="ib-gateway", port=4003, client_id=1, account_id="DUR305728")
+    with pytest.raises(node_live.PaperOnlyViolation, match="not a recognized paper port"):
+        node_live.assert_paper_only(live_port)
+
+
 def test_paper_only_rejects_a_live_account_prefix(monkeypatch):
     monkeypatch.setattr(node_live, "CONFIG", _config_with_paper_only(True))
     live_account = IBConfig(host="127.0.0.1", port=7497, client_id=1, account_id="U1234567")
@@ -216,18 +235,20 @@ def test_fund_state_is_configured_against_the_ib_account_venue_not_an_exchange()
 
 def test_watched_bar_types_covers_the_whole_watchlist():
     bar_types = node_live.watched_bar_types()
-    assert len(bar_types) == len(node_live.INSTRUMENT_IDS)
+    assert set(bar_types.keys()) == set(node_live.INSTRUMENT_IDS.keys())
 
 
 def test_watched_bar_types_matches_build_strategies_own_bar_types():
     """Phase N6 audit finding F1 was exactly two slightly-different copies
     of this string-building logic drifting apart - pin that the shared
     helper produces the identical strings build_strategies() actually
-    subscribes to, not just similarly-shaped ones."""
+    subscribes to, not just similarly-shaped ones. Keyed by symbol (Phase
+    N8 audit finding C1): the watchdog needs the logical watchlist symbol,
+    not just the bar-type string, to ask market_hours whether that
+    symbol's market is open."""
     strategies = node_live.build_strategies(StubPolicyProvider(), _fund_state())
-    from_strategies = {str(s.config.bar_type) for s in strategies}
-    from_watched = set(node_live.watched_bar_types())
-    assert from_strategies == from_watched
+    from_strategies = {s.config.symbol: str(s.config.bar_type) for s in strategies}
+    assert node_live.watched_bar_types() == from_strategies
 
 
 def test_bar_interval_seconds_maps_known_timeframes():

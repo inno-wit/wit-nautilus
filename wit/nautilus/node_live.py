@@ -33,6 +33,8 @@ touches.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from nautilus_trader.adapters.interactive_brokers.common import IB_VENUE
 from nautilus_trader.adapters.interactive_brokers.config import (
     InteractiveBrokersDataClientConfig,
@@ -57,10 +59,16 @@ from wit.nautilus.strategy import WitStrategy, WitStrategyConfig
 from wit.ops.alerts import Alerter
 from wit.ops.journal import Journal
 
-# 7497 = TWS paper, 4002 = IB Gateway paper (build plan §3 Phase N6 / Phase N0
-# confirmed live). 7496/4001 are the corresponding LIVE ports and are never
-# accepted here, regardless of WIT_PAPER_ONLY.
-PAPER_PORTS = (7497, 4002)
+# 7497 = TWS paper, 4002 = native IB Gateway paper (build plan §3 Phase N6 /
+# Phase N0 confirmed live). 4004 = the ghcr.io/gnzsnz/ib-gateway Docker image's
+# paper port (Phase N8) - that image binds the *native* 4002 to the
+# container's own loopback only (verified against the image's published ports
+# table, not guessed) and republishes it via socat on 0.0.0.0:4004 for other
+# containers on the Compose network to reach; 4002 itself is never reachable
+# from wit-nautilus's own `fund` container. 7496/4001/4003 are the
+# corresponding LIVE ports (4003 is 4004's live-account sibling) and are
+# never accepted here, regardless of WIT_PAPER_ONLY.
+PAPER_PORTS = (7497, 4002, 4004)
 
 # Watchlist symbol (the logical, MT5-style form desks/committee/risk key
 # everything by) -> (Nautilus/IB InstrumentId string, bar price type).
@@ -113,7 +121,7 @@ def assert_paper_only(ib: IBConfig | None = None) -> None:
     if ib.port not in PAPER_PORTS:
         raise PaperOnlyViolation(
             f"IBG_PORT={ib.port} is not a recognized paper port {PAPER_PORTS} "
-            f"(7497 TWS / 4002 Gateway) - refusing to boot."
+            f"(7497 TWS / 4002 native Gateway / 4004 dockerized ib-gateway) - refusing to boot."
         )
     if not ib.account_id.startswith("DU"):
         raise PaperOnlyViolation(
@@ -170,25 +178,20 @@ def _bar_type_str(ib_id: str, price_type: PriceType) -> str:
     return f"{ib_id}-{_bar_step(CONFIG.timeframe)}-{price_type.name}-EXTERNAL"
 
 
-def watched_bar_types() -> tuple[str, ...]:
-    """Every watchlist symbol's bar-type string, for
+def watched_bar_types() -> dict[str, str]:
+    """Watchlist symbol -> its bar-type string, for
     `FundStateActorConfig.watched_bar_types` (Phase N8's staleness
     watchdog) - computed independently of `build_strategies()` since
     `FundStateActor` is constructed before the strategies are, in
-    `build_node()`."""
-    return tuple(
-        _bar_type_str(ib_id, price_type)
-        for ib_id, price_type in INSTRUMENT_IDS.values()
-    )
-
-
-def bar_interval_seconds(timeframe: str) -> int:
-    """MT5-style timeframe -> seconds, for the staleness watchdog's alert/
-    halt thresholds (a multiple of this). Mirrors `_bar_step`'s coverage."""
-    mapping = {"M15": 900, "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400}
-    if timeframe not in mapping:
-        raise ValueError(f"no bar-interval mapping for timeframe {timeframe!r}")
-    return mapping[timeframe]
+    `build_node()`. A dict, not a bare tuple of bar-type strings (Phase N8
+    audit finding C1): the watchdog needs the logical watchlist symbol
+    (e.g. "EURUSD"), not just the Nautilus/IB instrument id, to ask
+    `wit.ops.market_hours` whether that symbol's market is even open right
+    now."""
+    return {
+        symbol: _bar_type_str(ib_id, price_type)
+        for symbol, (ib_id, price_type) in INSTRUMENT_IDS.items()
+    }
 
 
 def build_strategies(
@@ -232,15 +235,36 @@ def build_strategies(
     return strategies
 
 
+# MT5-style timeframe -> (Nautilus BarType step string, seconds). One table,
+# not two (Phase N8 audit finding I3): _bar_step and bar_interval_seconds
+# used to maintain separate mappings over the same five timeframes, the same
+# duplication shape N6's audit finding F1 already burned once for bar-type
+# strings themselves. Only the step used by the current watchlist
+# (CONFIG.timeframe = "H1") is exercised; extend when a per-symbol timeframe
+# is actually needed.
+_TIMEFRAMES: dict[str, tuple[str, int]] = {
+    "M15": ("15-MINUTE", 900),
+    "M30": ("30-MINUTE", 1800),
+    "H1": ("1-HOUR", 3600),
+    "H4": ("4-HOUR", 14400),
+    "D1": ("1-DAY", 86400),
+}
+
+
 def _bar_step(timeframe: str) -> str:
     """MT5-style timeframe ("H1", "M15") -> Nautilus BarType step string
-    ("1-HOUR", "15-MINUTE"). Only the step used by the current watchlist
-    (CONFIG.timeframe = "H1") is implemented; extend when a per-symbol
-    timeframe is actually needed."""
-    mapping = {"H1": "1-HOUR", "M15": "15-MINUTE", "M30": "30-MINUTE", "H4": "4-HOUR", "D1": "1-DAY"}
-    if timeframe not in mapping:
+    ("1-HOUR", "15-MINUTE")."""
+    if timeframe not in _TIMEFRAMES:
         raise ValueError(f"no Nautilus bar-step mapping for timeframe {timeframe!r}")
-    return mapping[timeframe]
+    return _TIMEFRAMES[timeframe][0]
+
+
+def bar_interval_seconds(timeframe: str) -> int:
+    """MT5-style timeframe -> seconds, for the staleness watchdog's alert/
+    halt thresholds (a multiple of this)."""
+    if timeframe not in _TIMEFRAMES:
+        raise ValueError(f"no bar-interval mapping for timeframe {timeframe!r}")
+    return _TIMEFRAMES[timeframe][1]
 
 
 def build_node() -> TradingNode:
@@ -271,6 +295,7 @@ def build_node() -> TradingNode:
             dream_state_path=CONFIG.dream.state_path,
             watched_bar_types=watched_bar_types(),
             bar_interval_seconds=bar_interval_seconds(CONFIG.timeframe),
+            heartbeat_path=str(Path(CONFIG.journal_path).parent / "heartbeat"),
         ),
         journal=journal, committee=provider, alerter=Alerter.from_env(),
     )

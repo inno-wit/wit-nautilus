@@ -1,0 +1,18 @@
+# Phase N8 audit finding L4: compose.yml's build context is the repo root (`..`), so
+# without this file the build sends .venv/ (~890MB) and .git/ to the Docker daemon on
+# every build - neither is used by Dockerfile, which only COPYs pyproject.toml and wit/.
+.venv/
+.git/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+data/
+backups/
+notebooks/
+*.egg-info/
+dist/
+build/
+.env
+docker/*.env

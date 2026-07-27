@@ -130,6 +130,36 @@ def cmd_status(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_healthcheck(_: argparse.Namespace) -> int:
+    """Container liveness check (Phase N8 audit finding I2): unlike `wit
+    status`, which always exits 0, this fails if the actor's poll loop
+    hasn't touched its heartbeat file recently - the difference between
+    "trading, halted, or hung" and "the process itself is dead or wedged".
+    Not meant for interactive use; Dockerfile's HEALTHCHECK runs it."""
+    from datetime import UTC, datetime
+
+    path = Path(CONFIG.journal_path).parent / "heartbeat"
+    if not path.exists():
+        print(f"No heartbeat file at {path} - node not started, or heartbeat_path unset.")
+        return 1
+    try:
+        last = datetime.fromisoformat(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError) as e:
+        print(f"Could not read heartbeat: {type(e).__name__}: {e}")
+        return 1
+    age = (datetime.now(UTC) - last).total_seconds()
+    # Generous relative to the actor's default 30s poll interval - this
+    # only needs to catch a genuinely wedged loop, not fire on ordinary
+    # jitter, and the CLI has no way to know a non-default
+    # poll_interval_seconds without also loading node-specific config.
+    stale_after_seconds = 300
+    if age > stale_after_seconds:
+        print(f"Heartbeat is {age:.0f}s old (> {stale_after_seconds}s) - poll loop looks wedged.")
+        return 1
+    print(f"Heartbeat {age:.0f}s old - OK.")
+    return 0
+
+
 def cmd_review(args: argparse.Namespace) -> int:
     """Score journaled decisions vs. realized P&L. Reflection reads realized
     P&L straight from the journal's own ``position_closed`` events (Phase N7
@@ -218,6 +248,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("resume", help="release the kill switch").set_defaults(func=cmd_resume)
     sub.add_parser("status", help="config, safety state, watchlist").set_defaults(func=cmd_status)
+    sub.add_parser("healthcheck", help="container liveness check (for Dockerfile's HEALTHCHECK)") \
+        .set_defaults(func=cmd_healthcheck)
 
     p_review = sub.add_parser("review", help="score journaled decisions vs realized P&L")
     p_review.add_argument("--days", type=int, default=7)

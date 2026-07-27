@@ -39,6 +39,7 @@ from nautilus_trader.model.identifiers import Venue
 
 from wit.config import CONFIG
 from wit.ops import dream as dream_mod
+from wit.ops import market_hours
 from wit.ops.alerts import Alerter
 from wit.ops.journal import Journal
 from wit.ops.reflection import Reflection
@@ -93,18 +94,31 @@ class FundStateActorConfig(ActorConfig, frozen=True):
     dream_state_path: str
     account_currency: str = "USD"
     poll_interval_seconds: int = 30
-    # Staleness watchdog (Phase N8): the string form of every BarType this
-    # fund subscribes to, so the actor can check Cache.bar() itself without
-    # needing a live reference to each WitStrategy. Empty by default (opt-in)
-    # so backtests/sweeps that don't care about live data health are
-    # unaffected - node_live.py's build_node() populates it for the real
-    # paper/live node. IB's daily gateway restart makes "quietly blind"
-    # (subscribed but no bars arriving, no error either) a real failure
-    # mode even with the resubscription Nautilus itself handles.
-    watched_bar_types: tuple[str, ...] = ()
+    # Staleness watchdog (Phase N8): watchlist symbol -> the string form of
+    # its BarType, so the actor can check Cache.bar() itself without needing
+    # a live reference to each WitStrategy - and, critically (Phase N8 audit
+    # finding C1), so it can ask wit.ops.market_hours whether THIS symbol's
+    # market is even supposed to be producing bars right now. A flat "bar
+    # age vs. a fixed multiple of the interval" rule with no session
+    # awareness engages the kill switch every single night on an RTH-only
+    # equity watchlist and every weekend on FX - proven by executing a real
+    # backtest with an overnight-shaped gap, not guessed. Empty by default
+    # (opt-in) so backtests/sweeps that don't care about live data health
+    # are unaffected - node_live.py's build_node() populates it for the
+    # real paper/live node. IB's daily gateway restart makes "quietly
+    # blind" (subscribed but no bars arriving, no error either) a real
+    # failure mode even with the resubscription Nautilus itself handles.
+    watched_bar_types: dict[str, str] = {}  # noqa: RUF012 - msgspec.Struct copies mutable defaults per instance, unlike dataclass
     bar_interval_seconds: int = 3600  # matches CONFIG.timeframe="H1"; override if that changes
     stale_alert_multiplier: float = 2.0   # alert once a bar is this many intervals late
     stale_halt_multiplier: float = 6.0    # engage the kill switch once it's this late
+    # Touched once per poll (Phase N8 audit finding I2): `wit status`, the
+    # Dockerfile's HEALTHCHECK command, always exits 0 - it reads only local
+    # files and has no way to tell "trading, halted, or hung" apart, so the
+    # container reported healthy even if the actor's poll loop had wedged.
+    # Empty by default (opt-in, no safety implication either way to default
+    # off) - node_live.py's build_node() sets it for the real node.
+    heartbeat_path: str = ""
 
 
 class FundStateActor(Actor):
@@ -125,6 +139,9 @@ class FundStateActor(Actor):
         self._day: object | None = None
         self._closed_pnls: list[tuple[int, float]] = []  # (ts_closed_ns, realized_pnl)
         self._stale_symbols: set[str] = set()  # currently-alerted staleness state, to alert once per onset
+        self._dead_symbols: set[str] = set()  # currently-halted-for staleness, to alert/journal once per onset
+        self._session_open: dict[str, bool] = {}  # last-observed open/closed per watched symbol
+        self._quiet_since: dict[str, datetime] = {}  # when each symbol's session was last seen to open
         self.dream_state = dream_mod.load(config.dream_state_path)
         self.journal = journal or Journal(CONFIG.journal_path)
         self.committee = committee
@@ -311,6 +328,23 @@ class FundStateActor(Actor):
         self._check_kill_switch()
         self._recompute_multipliers()
         self._check_bar_staleness()
+        self._touch_heartbeat()
+
+    def _touch_heartbeat(self) -> None:
+        """Real-wall-clock liveness signal for `wit healthcheck`/Docker's
+        HEALTHCHECK (Phase N8 audit finding I2) - deliberately real time,
+        not `self.clock.utc_now()`: a HEALTHCHECK process outside the
+        BacktestEngine has no access to simulated time, and this only
+        matters live anyway (nothing runs a container healthcheck against
+        a backtest)."""
+        if not self.config.heartbeat_path:
+            return
+        try:
+            path = Path(self.config.heartbeat_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(datetime.now(UTC).isoformat(), encoding="utf-8")
+        except OSError as e:
+            self.log.warning(f"could not write heartbeat: {type(e).__name__}: {e}")
 
     # -- bar staleness watchdog (Phase N8) ------------------------------------
     def _check_bar_staleness(self) -> None:
@@ -322,6 +356,33 @@ class FundStateActor(Actor):
         lasted. Reads ``Cache.bar()`` directly rather than going through any
         strategy, so this has no dependency on WitStrategy internals and no
         exposure to the NETTING position_id issue (bars aren't positions).
+
+        **Session-aware** (Phase N8 audit finding C1, round 9): a flat "bar
+        age vs. a multiple of the interval" rule with no concept of market
+        hours engages the kill switch every single night on an RTH-only
+        equity watchlist (~17.5h overnight, ~65h over a weekend, against a
+        6h default halt threshold) and every weekend on FX - reproduced by
+        executing a real backtest with an overnight-shaped gap, not
+        guessed. A symbol whose market is currently closed
+        (``market_hours.is_session_open`` - covers FX weekends too, unlike
+        ``is_tradeable``, which stays equity-only for the committee-gating
+        callers that already depend on that narrower scope) is skipped
+        entirely: no bars are expected, so no age is measured. The moment a
+        symbol's session is observed to transition closed -> open,
+        ``_quiet_since`` resets to *now* - without this, the first poll
+        after reopen would immediately measure the full closure as
+        staleness against the stale pre-close bar and false-alarm right at
+        open.
+
+        This same ``_quiet_since`` mechanism closes finding H2 for free:
+        a bar type that never lands a first bar (``bar is None``) used to
+        be treated as "still warming up" forever, the exact "subscribed
+        but no bars arriving" failure this watchdog exists to catch.
+        Now the age reference falls back to ``_quiet_since`` (when the
+        session was last seen to open, which - for a symbol whose session
+        was already open at actor start - is the actor's own start time),
+        so a permanently-missing first bar accumulates real age and
+        eventually alerts/halts like any other staleness.
 
         Two thresholds, both multiples of the configured bar interval: past
         ``stale_alert_multiplier`` it alerts (once, on the transition into
@@ -341,21 +402,45 @@ class FundStateActor(Actor):
 
         stale_now: set[str] = set()
         dead: list[str] = []
-        for bar_type_str in self.config.watched_bar_types:
+        for symbol, bar_type_str in self.config.watched_bar_types.items():
+            open_now = market_hours.is_session_open(symbol, CONFIG.session, now)
+            just_opened = open_now and not self._session_open.get(symbol, False)
+            self._session_open[symbol] = open_now
+            if just_opened:
+                self._quiet_since[symbol] = now
+            if not open_now:
+                continue  # market closed - no bars expected, not staleness
+
             try:
                 bar_type = BarType.from_str(bar_type_str)
             except ValueError:
                 continue
             # The Nautilus/IB instrument id (e.g. "NVDA.NASDAQ",
-            # "EUR/USD.IDEALPRO"), not the watchlist's logical symbol
-            # ("NVDA", "EURUSD") - unambiguous and directly actionable for
-            # debugging without needing the symbol<->bar_type mapping only
-            # node_live.py's INSTRUMENT_IDS otherwise carries.
+            # "EUR/USD.IDEALPRO"), not the watchlist's logical symbol - kept
+            # for alert/journal messages, unambiguous and directly
+            # actionable for debugging.
             instrument = str(bar_type.instrument_id)
             bar = self.cache.bar(bar_type)
-            if bar is None:
-                continue  # not staleness - warmup hasn't landed a first bar yet
-            age = now - unix_nanos_to_dt(bar.ts_event)
+            last_bar_ts = unix_nanos_to_dt(bar.ts_event) if bar is not None else None
+            # quiet_since is always populated by this point for any symbol
+            # currently open (just_opened sets it above, on this same poll,
+            # the first time open_now is ever True) - the `now` fallback
+            # only guards a state that can't actually occur.
+            quiet_since = self._quiet_since.get(symbol, now)
+            reference = max(last_bar_ts, quiet_since) if last_bar_ts is not None else quiet_since
+            age = now - reference
+            if age < timedelta(0):
+                # A future-dated reference (clock skew, or a bar the venue stamped
+                # ahead of this host's clock) would otherwise silently read as
+                # "perfectly fresh" forever (Phase N8 audit finding L1) - worth a
+                # log line since it means either this host's clock or the venue's
+                # bar timestamps can't be trusted, which is worth knowing about
+                # even though it isn't itself a staleness condition.
+                self.log.warning(
+                    f"{instrument}: bar/session reference is {-age} in the future "
+                    "- clock skew or a bogus timestamp; treating age as 0."
+                )
+                age = timedelta(0)
             if age > alert_after:
                 stale_now.add(instrument)
             if age > halt_after:
@@ -374,11 +459,25 @@ class FundStateActor(Actor):
                 "bar_stale_recovered", f"{recovered} received a fresh bar again",
                 symbols=recovered, ts=now,
             )
-        if dead and not self._halted:
-            reason = f"bar staleness: no data for {sorted(dead)} > {halt_after}"
-            self.engage_kill_switch(reason)
+        dead_now = set(dead)
+        newly_dead = sorted(dead_now - self._dead_symbols)
+        self._dead_symbols = dead_now
+
+        if newly_dead:
+            reason = f"bar staleness: no data for {newly_dead} > {halt_after}"
+            # Alert/journal once per symbol's transition into "dead", same
+            # dedup shape as newly_stale above - and unconditionally, not
+            # guarded by `not self._halted` (Phase N8 audit finding I1): a
+            # data outage that coincides with an existing halt from a
+            # different cause (the daily-loss breaker, or a manual `wit
+            # halt`) must still leave this more specific diagnosis on
+            # record instead of being silently swallowed. Only the
+            # kill-switch write itself is conditional - engaging it twice
+            # would just overwrite the same file with an equivalent reason.
             self.alerter.send(f"[staleness] HALTED: {reason}")
-            self.journal.log_event("bar_staleness_halt", reason, symbols=sorted(dead), ts=now)
+            self.journal.log_event("bar_staleness_halt", reason, symbols=newly_dead, ts=now)
+            if not self._halted:
+                self.engage_kill_switch(reason)
 
     # -- kill switch -----------------------------------------------------------
     def _check_kill_switch(self) -> None:

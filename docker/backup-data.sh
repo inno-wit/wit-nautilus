@@ -31,7 +31,20 @@ archive="$BACKUP_DIR/data-$stamp.tar.gz"
 # --exclude the backup dir itself, in case it was ever nested under data/ by mistake -
 # tar-ing a growing archive into itself is exactly the kind of failure mode worth a
 # one-line guard against, cheap as it is to write.
-tar -czf "$archive" -C "$REPO_ROOT" --exclude="backups" data/
+#
+# tar exits 1 (not 0) when a file it's reading changes size mid-read (its own "file
+# changed as we read it" warning) - journal.jsonl is exactly such a file, actively
+# appended to by a running node at 3am (Phase N8 audit finding M4). set -e would abort
+# the whole script on that exit code and skip the retention prune below over a backup
+# that in fact succeeded. Exit codes >1 (2: fatal error, e.g. disk full) still abort.
+tar -czf "$archive" -C "$REPO_ROOT" --exclude="backups" data/ || {
+    status=$?
+    if [[ $status -ne 1 ]]; then
+        echo "tar failed with exit $status" >&2
+        exit "$status"
+    fi
+    echo "tar warned (exit 1, likely a file changed mid-read - e.g. the live journal); continuing." >&2
+}
 
 echo "Backed up $DATA_DIR -> $archive ($(du -h "$archive" | cut -f1))"
 

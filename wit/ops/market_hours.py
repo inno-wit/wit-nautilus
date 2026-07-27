@@ -21,12 +21,14 @@ contract is already in scope.
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from zoneinfo import ZoneInfo
 
 from wit.config import SessionConfig
 
 _NY = "America/New_York"
+_FX_WEEK_CLOSE = time(17, 0)  # Friday 17:00 ET - the standard forex week close
+_FX_WEEK_OPEN = time(17, 0)   # Sunday 17:00 ET - the standard forex week open
 
 
 def is_tradeable(
@@ -55,3 +57,33 @@ def is_tradeable(
         (f"outside US equity cash session "
          f"({cfg.cash_open:%H:%M}–{cfg.cash_close:%H:%M} ET)"),
     )
+
+
+def is_session_open(symbol: str, cfg: SessionConfig, now: datetime | None = None) -> bool:
+    """Whether ``symbol``'s market is open right now - unlike ``is_tradeable``,
+    covers *every* watchlist symbol, not only equities, because the Phase N8
+    bar staleness watchdog needs to know when *any* instrument is expected to
+    be silent (a closed equity session, or FX's Friday-evening-to-Sunday-
+    evening weekend close), not just when the committee should skip an
+    equity that happens to be closed. ``is_tradeable`` stays untouched and
+    equity-only - this function delegates to it for equities and adds the
+    FX weekend rule for everything else, rather than widening
+    ``is_tradeable``'s own scope (that function's callers assume "equities
+    only" and must not silently start gating FX too).
+
+    Fail-open, same as ``is_tradeable``: missing tzdata returns ``True``.
+    """
+    now = now or datetime.now(UTC)
+    if cfg.enforce_equity_hours and symbol.upper() in cfg.equity_symbols:
+        tradeable, _reason = is_tradeable(symbol, cfg, now)
+        return tradeable
+    try:
+        local = now.astimezone(ZoneInfo(_NY))
+    except Exception:  # noqa: BLE001 - missing tzdata must not block trading
+        return True
+    weekday, t = local.weekday(), local.timetz().replace(tzinfo=None)
+    if weekday == 4 and t >= _FX_WEEK_CLOSE:   # Friday, after the week close
+        return False
+    if weekday == 5:                            # all of Saturday
+        return False
+    return not (weekday == 6 and t < _FX_WEEK_OPEN)   # Sunday, before the week open

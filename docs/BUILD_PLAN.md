@@ -709,6 +709,71 @@ not a mock: bars for a symbol stop mid-backtest while a *different* Nautilus dat
 point (confirmed necessary: `BacktestEngine.run()`'s own docs state "timer advancement stops
 at data exhaustion", so a timer cannot outlive the run's very last event on its own).
 
+**The Phase N8 audit (round 9, against commit `204124e`) found the as-shipped watchdog was
+session-blind, and the deployment plumbing around it had two networking defects — verdict
+FAIL, 1 Critical/2 High/4 Medium/4 Low/3 Informational.** `_check_bar_staleness()` measured
+raw bar age against a fixed multiple of the interval with no concept of market hours (C1):
+every RTH-only equity watchlist would halt itself every single night, and every FX symbol
+every weekend, the exact failure mode the same finding warned about at design time above —
+proven again by executing a real backtest across an overnight equity close and a weekend FX
+gap, not by inspection. A permanently-missing first bar on a subscription (`Cache.bar()`
+returning `None` forever) was separately invisible to the watchdog (H2): treated as
+"still warming up," it never accumulated age, so the one failure mode the watchdog exists to
+catch — subscribed but silently never receiving data — was the one case it could not detect.
+On the deployment side, `IBG_PORT=4002` (H1) targeted a port the `gnzsnz/ib-gateway` Docker
+image binds to its own container's loopback only; the image republishes the real paper port
+via `socat` on `4004`, so `fund` could never actually reach `ib-gateway` inside Compose, and
+`node_live.py`'s `PAPER_PORTS` allowlist would have rejected that same port as non-paper had
+the networking worked at all. Medium findings: no liveness signal existed for the Docker
+`HEALTHCHECK` (`wit status` always exits 0 regardless of whether the poll loop is alive or
+wedged); the image hardcoded `useradd --uid 1000`, silently unable to write the bind-mounted
+`data/` — including the kill switch — on any VPS where the deploy user's real uid differs.
+Lower-severity findings: `vps-setup.sh` hardcoded `ufw allow 22/tcp` (would lock out a VPS
+already hardened to a non-standard SSH port) and checked `command -v docker` alone to decide
+whether to (re)run the installer (a Compose-less Docker CLI would pass that check and then
+fail on the script's own last line); `backup-data.sh` didn't tolerate tar's exit code 1
+(triggered by the live-growing journal changing size mid-read), aborting the nightly cron
+before its retention prune ran; a negative bar/session age (clock skew) would have silently
+read as "healthy" forever; and the build context (repo root) shipped `.venv/` (~890MB) and
+`.git/` to the Docker daemon on every build with no `.dockerignore`.
+
+**Fixed in the same phase, re-verified by full suite + lint, not by re-reading the diff.**
+`wit/ops/market_hours.py` gained `is_session_open()` — unlike the pre-existing
+`is_tradeable()` (left untouched; still equity-only for its existing callers), it covers
+every watchlist symbol, deferring to `is_tradeable()` for configured equities and applying a
+standalone Friday-17:00-to-Sunday-17:00-NY FX week-close rule otherwise. `_check_bar_staleness()`
+was rewritten around a single new `_quiet_since` mechanism that closes C1 and H2 together: a
+per-symbol timestamp reset to *now* the moment that symbol's session is observed to transition
+closed → open, used as the staleness reference whenever no bar exists yet (fixing H2 — a
+missing first bar now accumulates real age from session-open instead of never aging) and as a
+floor under the bar-timestamp reference otherwise (fixing C1 — a closed session is skipped
+entirely, and the first poll after reopen measures age from reopen, not from the stale
+pre-close bar, avoiding a false-positive at every single market open). `docker/compose.yml`'s
+`IBG_PORT` moved to `4004` and `ib-gateway`'s healthcheck now probes `4004` directly (the exact
+path `fund` uses) rather than the unreachable `4002`; `node_live.py`'s `PAPER_PORTS` grew to
+accept `4004` alongside the native 7497/4002. A new `wit healthcheck` CLI command (`wit/cli.py`)
+reads a heartbeat file `FundStateActor` now touches every poll (`heartbeat_path` on
+`FundStateActorConfig`, wired by `node_live.py`'s `build_node()`), failing if it's missing or
+stale by more than 300s — `docker/Dockerfile`'s `HEALTHCHECK` now runs this instead of `wit
+status`, a real liveness signal with no Anthropic API call in the loop (`wit doctor` was
+rejected for the same reason the design section above already rejected it). The Dockerfile
+also gained `ARG FUND_UID=1000`, threaded into `useradd --uid ${FUND_UID}`, with
+`compose.yml`'s `fund` service passing it through `build.args` from a `FUND_UID` env var the
+deploy documentation now calls out explicitly. `vps-setup.sh` detects the real configured SSH
+port (`sshd -T`, falling back to grepping `sshd_config`, falling back to 22) before writing its
+one `ufw allow` rule, and probes `docker compose version` independently of `command -v docker`
+before deciding whether to (re)run the installer. `backup-data.sh` now treats tar's exit code 1
+as a warning, not a fatal error, so the retention prune still runs after a backup that raced a
+live-growing journal write. `_check_bar_staleness()` also now clamps and logs (rather than
+silently accepts) a negative age. A root `.dockerignore` excludes `.venv/`, `.git/`, and the
+`data/`/`backups/` bind-mount targets from the build context. Two new secrets files split per
+service (`docker/ib-gateway.env.example` for the third-party image, `.env.example` trimmed to
+`wit`'s own vars) close a lower-severity finding that a single shared `.env` gave the
+third-party `ib-gateway` image blanket access to `wit`'s own secrets and vice versa. Full suite
+(265 tests) and `ruff check .` both clean after the fixes, including new/updated coverage for
+session-gated staleness across an equity close and an FX weekend, a permanently-missing first
+bar, the alert/halt middle band, and the dockerized paper-port allowlist.
+
 ### Phase N9 — Validation gate
 
 Mirrors the MT5 build's `doctor` → `once` → `once --execute` → `schedule --execute` discipline,
