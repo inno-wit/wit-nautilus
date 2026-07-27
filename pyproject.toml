@@ -2,7 +2,7 @@
 name = "wit-nautilus"
 version = "0.1.0"
 description = "Wit Hedge Fund's LLM committee + risk pipeline, ported to NautilusTrader over Interactive Brokers"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "python-dotenv>=1.0",
 ]

@@ -1,9 +1,9 @@
 """CLI entry point (``wit <command>``).
 
-Phase N1: ``doctor`` and ``version`` only, and ``doctor`` checks config/env presence — no IB
+Phase N1: ``doctor`` and ``version`` only, and ``doctor`` checks config/env presence - no IB
 or LLM connectivity yet (that lands in Phase N6/N3). ``backtest``/``sweep``/``paper``/``live``/
 ``halt``/``resume``/``status``/``reconcile`` are added as their owning phases land; see the
-build plan §Phase N7.
+build plan, Phase N7.
 """
 from __future__ import annotations
 
@@ -14,9 +14,9 @@ from wit.config import CONFIG
 
 
 def cmd_version(_: argparse.Namespace) -> int:
-    from wit import __doc__ as pkg_doc
+    from wit import __version__
 
-    print(f"wit-nautilus — {pkg_doc}")
+    print(f"wit-nautilus {__version__}")
     return 0
 
 
@@ -29,7 +29,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     if not CONFIG.llm.deep_model or not CONFIG.llm.quick_model:
         problems.append("WIT_DEEP_MODEL / WIT_QUICK_MODEL are not both set (.env)")
     if not CONFIG.ib.account_id:
-        problems.append("TWS_ACCOUNT is not set (.env) — needed for the paper_only boot assertion (Phase N6)")
+        problems.append("TWS_ACCOUNT is not set (.env) - needed for the paper_only boot assertion (Phase N6)")
     if not CONFIG.safety.paper_only:
         problems.append("WIT_PAPER_ONLY is false — this build must stay paper until Phase N9's gate passes")
 
@@ -43,7 +43,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
             print(f"  - {p}")
         return 1
 
-    print("\nConfig OK. (Live IB/LLM connectivity checks are not implemented yet — Phase N3/N6.)")
+    print("\nConfig OK. (Live IB/LLM connectivity checks are not implemented yet - Phase N3/N6.)")
     return 0
 
 
