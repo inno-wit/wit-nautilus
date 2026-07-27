@@ -42,3 +42,32 @@ def test_fx_and_metals_are_always_tradeable():
 def test_enforcement_can_be_disabled():
     off = SessionConfig(enforce_equity_hours=False)
     assert market_hours.is_tradeable("NVDA", off, MON_CLOSED) == (True, "")
+
+
+# -- is_session_open (Phase N8's staleness watchdog; wider than is_tradeable) --
+
+def test_session_open_matches_tradeable_for_an_equity_during_cash_hours():
+    assert market_hours.is_session_open("NVDA", CFG, TUE_OPEN) is True
+
+
+def test_session_open_closed_for_an_equity_outside_cash_hours():
+    assert market_hours.is_session_open("NVDA", CFG, MON_CLOSED) is False
+
+
+def test_session_open_equity_branch_ignores_enforce_equity_hours():
+    """Phase N8 round-10 audit (Medium finding): `enforce_equity_hours` only
+    controls whether the COMMITTEE skips a closed equity - it must not also
+    silently reopen the staleness watchdog's RTH gate for that same symbol,
+    or WIT_EQUITY_HOURS=false reinstates a nightly false-halt (finding C1)
+    as a side effect of an unrelated flag."""
+    off = SessionConfig(enforce_equity_hours=False)
+    assert market_hours.is_tradeable("NVDA", off, MON_CLOSED) == (True, "")  # unaffected
+    assert market_hours.is_session_open("NVDA", off, MON_CLOSED) is False    # still gated
+
+
+def test_session_open_fx_open_during_the_week():
+    assert market_hours.is_session_open("EURUSD", CFG, TUE_OPEN) is True
+
+
+def test_session_open_fx_closed_on_saturday():
+    assert market_hours.is_session_open("EURUSD", CFG, SAT) is False

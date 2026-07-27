@@ -543,6 +543,34 @@ def test_staleness_watchdog_alerts_then_halts_when_bars_stop_arriving(tmp_path, 
     assert "bar_staleness_halt" in kinds
 
 
+def test_staleness_watchdog_kill_switch_rearms_after_a_resume_that_did_not_fix_the_feed(
+    tmp_path, capsys,
+):
+    """Phase N8 round-10 audit finding NEW-1: a regression introduced by the
+    same round's own I1 fix. The kill-switch write used to be gated on
+    `newly_dead` (the delta since the last poll) instead of `dead_now` (every
+    currently-dead symbol) - so once a symbol was recorded dead, `newly_dead`
+    stayed empty on every later poll and a `wit resume` that didn't actually
+    fix the feed left the kill switch unarmed forever after, even though the
+    outage never cleared."""
+    fund_state, _journal = _run_staleness_backtest(tmp_path)
+    assert fund_state.is_halted()
+
+    kill_switch = Path(fund_state.config.kill_switch_file)
+    assert kill_switch.exists()
+    kill_switch.unlink()  # simulates `wit resume`
+
+    fund_state._poll_once()  # the feed is still dead - nothing about the data changed
+
+    assert kill_switch.exists(), "kill switch must re-arm within one poll of a no-op resume"
+    assert fund_state.is_halted()
+    # Re-arming must not re-alert/re-journal (dead_now == the already-recorded
+    # _dead_symbols, so `newly_dead` is still empty) - only the kill-switch
+    # write itself is unconditional on `dead_now and not self._halted`.
+    out = capsys.readouterr().out
+    assert out.count("[staleness] HALTED") == 1
+
+
 def test_staleness_watchdog_alerts_only_once_per_onset(tmp_path, capsys):
     """A symbol stuck stale for hours must not spam an alert on every
     30-minute poll - only the transition into staleness is newsworthy."""

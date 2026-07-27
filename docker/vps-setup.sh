@@ -81,13 +81,20 @@ ufw default deny incoming
 ufw default allow outgoing
 ufw allow "$SSH_PORT/tcp" comment 'SSH'
 # --force skips the interactive "this may disrupt existing connections" prompt - safe
-# here specifically because 22/tcp was just allowed above, in this same invocation,
-# before enable runs.
+# here specifically because $SSH_PORT/tcp was just allowed above, in this same
+# invocation, before enable runs.
 ufw --force enable
 ufw status verbose
 
+DEPLOY_UID="$(id -u "$DEPLOY_USER")"
 echo
 echo "Done. Log out and back in as '$DEPLOY_USER' (or run 'newgrp docker'), then:"
 echo "  cd /path/to/wit-nautilus"
 echo "  cp .env.example .env   # fill in real values - see docker/compose.yml's own comments"
+# FUND_UID belongs in the repo-root .env, NOT docker/ib-gateway.env (Phase N8 round-10
+# audit, Medium finding): compose.yml's build.args interpolation reads Compose's own
+# .env lookup, which - for the documented `docker compose -f docker/compose.yml up -d`
+# invocation run from the repo root - resolves against the repo root's .env, not
+# anything under docker/.
+echo "  echo 'FUND_UID=$DEPLOY_UID' >> .env   # so the fund container can write data/ (uid of '$DEPLOY_USER')"
 echo "  docker compose -f docker/compose.yml up -d"

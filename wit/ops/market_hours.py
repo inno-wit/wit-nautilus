@@ -31,6 +31,15 @@ _FX_WEEK_CLOSE = time(17, 0)  # Friday 17:00 ET - the standard forex week close
 _FX_WEEK_OPEN = time(17, 0)   # Sunday 17:00 ET - the standard forex week open
 
 
+def _equity_cash_session_open(weekday: int, t: time, cfg: SessionConfig) -> bool:
+    """Is a US equity's regular cash session open right now (local NY wall-clock
+    already resolved by the caller)? Pure market-structure fact - shared by
+    ``is_tradeable`` (gated behind ``enforce_equity_hours``) and
+    ``is_session_open`` (deliberately NOT gated behind that flag - see its
+    docstring)."""
+    return weekday < 5 and cfg.cash_open <= t < cfg.cash_close
+
+
 def is_tradeable(
     symbol: str, cfg: SessionConfig, now: datetime | None = None
 ) -> tuple[bool, str]:
@@ -47,11 +56,11 @@ def is_tradeable(
         local = now.astimezone(ZoneInfo(_NY))
     except Exception:  # noqa: BLE001 - missing tzdata must not block trading
         return True, ""
-    if local.weekday() >= 5:
-        return False, "US equity market closed (weekend)"
-    t = local.timetz().replace(tzinfo=None)
-    if cfg.cash_open <= t < cfg.cash_close:
+    weekday, t = local.weekday(), local.timetz().replace(tzinfo=None)
+    if _equity_cash_session_open(weekday, t, cfg):
         return True, ""
+    if weekday >= 5:
+        return False, "US equity market closed (weekend)"
     return (
         False,
         (f"outside US equity cash session "
@@ -74,14 +83,21 @@ def is_session_open(symbol: str, cfg: SessionConfig, now: datetime | None = None
     Fail-open, same as ``is_tradeable``: missing tzdata returns ``True``.
     """
     now = now or datetime.now(UTC)
-    if cfg.enforce_equity_hours and symbol.upper() in cfg.equity_symbols:
-        tradeable, _reason = is_tradeable(symbol, cfg, now)
-        return tradeable
     try:
         local = now.astimezone(ZoneInfo(_NY))
     except Exception:  # noqa: BLE001 - missing tzdata must not block trading
         return True
     weekday, t = local.weekday(), local.timetz().replace(tzinfo=None)
+    if symbol.upper() in cfg.equity_symbols:
+        # Deliberately NOT gated behind `cfg.enforce_equity_hours` (Phase N8
+        # round-10 audit, Medium finding): that flag exists to control whether
+        # the COMMITTEE skips a closed equity, a policy choice - it says nothing
+        # about whether the exchange is physically producing bars right now,
+        # which is a market-structure fact. Gating this branch on the same flag
+        # meant WIT_EQUITY_HOURS=false silently reinstated finding C1 (nightly
+        # false-halt) for every equity on the watchlist, purely as a side effect
+        # of a flag whose only documented purpose is the committee-skip above.
+        return _equity_cash_session_open(weekday, t, cfg)
     if weekday == 4 and t >= _FX_WEEK_CLOSE:   # Friday, after the week close
         return False
     if weekday == 5:                            # all of Saturday

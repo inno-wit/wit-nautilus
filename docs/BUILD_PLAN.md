@@ -774,6 +774,58 @@ third-party `ib-gateway` image blanket access to `wit`'s own secrets and vice ve
 session-gated staleness across an equity close and an FX weekend, a permanently-missing first
 bar, the alert/halt middle band, and the dockerized paper-port allowlist.
 
+**Round 10 verification (against commit `80faaab`) found the round-9 fix regressed one of its
+own findings, plus one gitignore gap and one config-coupling gap — verdict FAIL, 2 High/2
+Medium, everything else confirmed Fixed by independent re-derivation, not by re-reading the
+diff.** `_dead_symbols` tracking, added in round 9 to stop the staleness-halt alert/journal
+from spamming on every poll once halted (finding I1), also ended up gating the kill-switch
+*write itself* on `newly_dead` (the set delta since the previous poll) rather than `dead_now`
+(every currently-dead symbol) — so once a symbol was recorded dead, `newly_dead` stayed empty
+on every subsequent poll, and a `wit resume` that didn't actually fix the underlying feed left
+the kill switch unarmed forever after, even though the outage never cleared. Separately,
+`docker/ib-gateway.env` (round 9's own L2 fix, meant to isolate the third-party image's
+secrets from `wit`'s own `.env`) was never actually added to `.gitignore` — only the shared
+root `.env` was covered, so the fix's own artifact would have been the first thing `git add -A`
+committed. And `is_session_open()`'s equity branch delegated to `is_tradeable()` gated behind
+`cfg.enforce_equity_hours` — a flag whose only documented purpose is letting the committee
+evaluate a closed equity, not a "does this exchange physically produce bars" fact — so
+`WIT_EQUITY_HOURS=false` silently reinstated finding C1 (nightly false-halt) for every equity
+on the watchlist as an unintended side effect of an unrelated config knob.
+
+**Fixed, re-verified by full suite + a mutation-style regression test for the exact defect
+mechanism, not just re-reading the new code.** The kill-switch engagement in
+`_check_bar_staleness()` now checks `dead_now and not self._halted` unconditionally every poll
+(alert/journal stay gated on `newly_dead`, so the dedup I1 was fixing is preserved); a new test
+drives a real backtest to a genuine halt, deletes the kill-switch file to simulate a no-op `wit
+resume`, calls one more poll directly, and asserts the file re-appears within that single poll
+— proving the fix by executing the failure mode, the same standard this phase's other findings
+were held to. `.gitignore` gained `docker/*.env` (with an explicit `!docker/*.env.example`
+carve-out); `git check-ignore` confirms `docker/ib-gateway.env` is now ignored and the example
+isn't. `market_hours.py` factored a shared `_equity_cash_session_open()` helper: `is_tradeable`
+keeps its `enforce_equity_hours` gate (policy — should the committee bother evaluating a closed
+equity), while `is_session_open`'s equity branch now calls the RTH check directly, independent
+of that flag (market structure — bars don't arrive outside RTH regardless of whether the
+committee is configured to care); two new unit tests in `test_market_hours.py` pin exactly this
+decoupling (`is_tradeable` unaffected by `enforce_equity_hours=False`, `is_session_open` still
+gated). `.env.example` also picked up two accuracy fixes surfaced along the way: the stale
+`ib-gateway/4002` comment (should have read `4004` since round 9's own H1 fix) and a documented
+`FUND_UID` line, since round 9's compose.yml comment claimed `vps-setup.sh` prints the deploy
+user's uid in its closing instructions when it didn't yet — `vps-setup.sh` now actually does
+(`id -u "$DEPLOY_USER"`, echoed as a `FUND_UID=` line to append to the repo-root `.env`, since
+that's the file Compose's own `.env` lookup resolves against for the documented
+`docker compose -f docker/compose.yml up -d ...` invocation run from the repo root).
+
+**Known, accepted residuals (non-blocking, explicitly deferred to N9, not silently dropped):**
+round 10 also flagged (a) no market-holiday calendar — a handful of weekdays a year (e.g. US
+Thanksgiving, Christmas) will read as "session open, no bars" for the RTH-hours equity branch
+and false-halt exactly like a genuine feed outage would, since `is_session_open` only knows
+weekday/weekend + FX week boundaries, and (b) the default 6× halt multiplier inside a 6.5h
+equity cash session gives roughly 1.5 sessions of detection latency for a genuine outage on a
+thinly-scheduled poll interval. Both are real, but a holiday calendar needs a real data source
+(and a decision on where it lives / how it's kept current) and the multiplier is a risk-tuning
+knob, not a code defect — exactly the kind of thing N9's staged, attended soak is for rather
+than a guess made here.
+
 ### Phase N9 — Validation gate
 
 Mirrors the MT5 build's `doctor` → `once` → `once --execute` → `schedule --execute` discipline,

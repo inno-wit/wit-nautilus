@@ -5,6 +5,8 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .env
+docker/*.env
+!docker/*.env.example
 data/*.jsonl
 data/*.json
 data/*.db

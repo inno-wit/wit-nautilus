@@ -471,13 +471,20 @@ class FundStateActor(Actor):
             # data outage that coincides with an existing halt from a
             # different cause (the daily-loss breaker, or a manual `wit
             # halt`) must still leave this more specific diagnosis on
-            # record instead of being silently swallowed. Only the
-            # kill-switch write itself is conditional - engaging it twice
-            # would just overwrite the same file with an equivalent reason.
+            # record instead of being silently swallowed.
             self.alerter.send(f"[staleness] HALTED: {reason}")
             self.journal.log_event("bar_staleness_halt", reason, symbols=newly_dead, ts=now)
-            if not self._halted:
-                self.engage_kill_switch(reason)
+        # Deliberately keyed on `dead_now`, not `newly_dead` (Phase N8 round-10 audit
+        # finding NEW-1, a regression the round-9 I1 fix introduced): `_dead_symbols`
+        # is never cleared on `wit resume`, so gating the kill-switch write on
+        # `newly_dead` meant a still-dead feed produced an empty `newly_dead` on every
+        # poll after a resume and the kill switch never re-engaged, even though the
+        # underlying outage never cleared. Re-checking `not self._halted` against the
+        # full `dead_now` set every poll re-arms it within one poll interval of a
+        # resume that didn't actually fix anything, while still writing the file at
+        # most once per halt (the `not self._halted` guard).
+        if dead_now and not self._halted:
+            self.engage_kill_switch(f"bar staleness: no data for {sorted(dead_now)} > {halt_after}")
 
     # -- kill switch -----------------------------------------------------------
     def _check_kill_switch(self) -> None:
