@@ -40,6 +40,14 @@ def test_round_quantity_with_no_configured_max_does_not_clamp_down():
     assert NVDA.round_quantity(50_000.0) == 50_000.0
 
 
+def test_round_quantity_zero_or_negative_returns_zero_not_the_minimum():
+    """Phase N4 audit finding F8: a residual of 0 (or a negative, from a
+    caller bug) must not clamp up to min_quantity - a future exit/flatten
+    path calling this would silently open a position instead of closing one."""
+    assert EURUSD.round_quantity(0.0) == 0.0
+    assert EURUSD.round_quantity(-50.0) == 0.0
+
+
 def test_round_quantity_zero_step_still_clamps_to_min_and_max():
     spec = InstrumentSpec(instrument_id="x", price_increment=0.01,
                           min_quantity=10.0, quantity_step=0.0, max_quantity=100.0)

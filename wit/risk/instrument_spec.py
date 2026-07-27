@@ -47,10 +47,16 @@ class InstrumentSpec:
     quantity_step: float
     max_quantity: float | None = None
     # Account-currency P&L per 1.0 price-unit move, per 1 unit of quantity.
-    # 1.0 for every instrument on the current watchlist: US equities (1 share
-    # = 1 unit) and EURUSD held in a USD account (quote currency is already
-    # USD, so no conversion). Override when a future instrument's quote
-    # currency differs from the account currency.
+    # 1.0 is correct for every instrument on wit.config.CONFIG.watchlist as of
+    # Phase N4: US equities (1 share = 1 unit) and EURUSD held in a USD account
+    # (quote currency is already USD, so no conversion). It is NOT correct for
+    # a futures contract (multiplier != 1, e.g. an ES/MES resolution of an
+    # index) or an instrument whose quote currency differs from the account
+    # currency — the 1.0 default is silent, so adding either class to the
+    # watchlist requires passing an explicit value_per_unit at every spec_for()
+    # call site, not relying on this default (Phase N4 audit finding F3: this
+    # is exactly how "tick_value shim wrong -> position sizes off by an order
+    # of magnitude", the build plan's own named risk, would happen).
     value_per_unit: float = 1.0
     # Configured floor in price units — see module docstring. 0.0 = no floor.
     min_stop_distance: float = 0.0
@@ -63,7 +69,16 @@ class InstrumentSpec:
         return round(steps * self.price_increment, 10)
 
     def round_quantity(self, qty: float) -> float:
-        """Snap to the broker's quantity step and clamp to its limits."""
+        """Snap to the broker's quantity step and clamp to its limits.
+
+        ``qty <= 0`` returns ``0.0`` rather than clamping up to ``min_quantity``
+        — ``wit/risk/sizing.py::build_plan`` already pre-guards every call it
+        makes here, but this is a public shim other callers (a future exit/
+        flatten path) will also use, and clamping a zero or negative residual
+        up to the minimum would silently open a new position instead of
+        closing one (Phase N4 audit finding F8)."""
+        if qty <= 0:
+            return 0.0
         if self.quantity_step <= 0:
             snapped = qty
         else:

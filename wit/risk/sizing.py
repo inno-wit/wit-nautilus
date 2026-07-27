@@ -159,7 +159,16 @@ def build_plan(
         blocked.append(
             f"Markov regime opposes {action} (signal {mk.signal:+.2f}, regime {mk.regime})"
         )
-    spread_pct = (spread / tech.last_close) if tech.last_close else 0.0
+    # A malformed quote (broken feed, de-listed contract, crossed/inverted book)
+    # must block, not silently disable the spread gate. MT5's spread_points was a
+    # broker-reported non-negative int, so this couldn't arise there; spread is
+    # now a caller-supplied float (ask - bid), which can be garbage. Phase N4
+    # audit findings F1/F2.
+    if tech.last_close <= 0:
+        blocked.append("no valid last price (last_close <= 0) - quote appears broken")
+    elif spread < 0:
+        blocked.append(f"spread {spread} is negative - quote appears crossed/broken")
+    spread_pct = (spread / tech.last_close) if tech.last_close > 0 else 0.0
     if spread_pct > risk.max_spread_pct:
         blocked.append(
             f"spread {spread_pct:.3%} of price exceeds cap {risk.max_spread_pct:.3%}"
@@ -280,6 +289,8 @@ def revalidate_plan(
     live_entry = ask if plan.action == "BUY" else bid
     if live_entry <= 0:
         return "no live price available"
+    if spread < 0:
+        return f"live spread {spread} is negative - quote appears crossed/broken"
 
     if plan.entry > 0:
         drift = abs(live_entry - plan.entry) / plan.entry
@@ -287,7 +298,7 @@ def revalidate_plan(
             return (f"price drifted {drift:.3%} from planned entry "
                     f"(cap {risk.max_entry_slippage_pct:.3%})")
 
-    spread_pct = (spread / live_entry) if live_entry else 0.0
+    spread_pct = (spread / live_entry) if live_entry > 0 else 0.0
     if spread_pct > risk.max_spread_pct:
         return f"live spread {spread_pct:.3%} of price exceeds cap {risk.max_spread_pct:.3%}"
 

@@ -98,11 +98,16 @@ Nautilus's `Instrument` gives `price_increment`/`size_increment`/`multiplier`, n
 class (US equities: 1 share = 1 unit, trivial; FX spot: quantity in base-currency units, P&L
 needs quote→account currency conversion; futures: `multiplier` × price move).
 
-**Decision: port `sizing.py`'s logic unchanged**, add a new `instrument_spec.py` shim that
+**Decision: port `sizing.py`'s *gates* unchanged**, add a new `instrument_spec.py` shim that
 turns a Nautilus `Instrument` into the same `(loss_per_unit, min_qty, qty_step)` shape
-`build_plan` already consumes. `build_plan` itself does not change — that's what keeps the risk
-guarantees byte-identical. `stops_level_points` (MT5's broker-minimum-stop) has no IB
-equivalent; replace with a configured floor, same "widen the stop, don't reject" behavior.
+`build_plan` already consumes. **Update (Phase N4, as shipped):** `build_plan`'s signature and
+one gate's *kind* did change — see the Phase N4 section below for exactly what and why; "byte-
+identical" turned out to describe the gate ordering/thresholds/reason-strings, not the function
+body verbatim. That's the risk guarantee that actually matters and it did hold; this note exists
+so this section stops contradicting the code. `stops_level_points` (MT5's broker-minimum-stop)
+has no IB equivalent; replaced with a configured floor (`InstrumentSpec.min_stop_distance`,
+default `0.0` = no floor), same "widen the stop, don't reject" behavior. That default needs a
+per-instrument value set before Phase N6 goes live — see the Risks table.
 
 ### 1.4 Where each safety guarantee lives now
 
@@ -270,13 +275,26 @@ resource. Consider registering a dedicated executor for committee work in `WitSt
 1. `adaptive.py` — verbatim (pure math).
 2. `instrument_spec.py` (new) — `spec_for(instrument, ...) -> InstrumentSpec` using the Phase
    N0 instrument table.
-3. `sizing.py` — port with the *only* substantive change being `SymbolSpec` → `InstrumentSpec`.
-   Gate ordering, `MARKOV_VETO_THRESHOLD`, blocked-reason strings, and `revalidate_plan`'s
-   checks all stay as-is.
+3. `sizing.py` — port. **As actually shipped (Phase N4 audit, superseding this section's
+   original text below):** gate ordering, `MARKOV_VETO_THRESHOLD`, and every blocked-reason
+   string are unchanged, but `SymbolSpec` → `InstrumentSpec` was not the only substantive
+   change — `RiskConfig.max_spread_points` (an MT5 "points" concept with no IBKR equivalent)
+   was dropped entirely, `spread_points: int` became `spread: float` in native price units
+   throughout `build_plan`/`revalidate_plan`, and `revalidate_plan`'s live-spread check changed
+   from a points-only test to a pct-only test (a substitution, not a translation — the original
+   plan text below undersold this). A malformed-quote guard (`last_close <= 0` / `spread < 0`)
+   was added after the audit found the pct-only gate fails open on a broken quote, which the
+   points cap had been incidentally protecting against. See `wit/risk/sizing.py`'s and
+   `wit/risk/instrument_spec.py`'s module docstrings for the full reasoning.
 
-**Gate:** the MT5 repo's `sizing` test suite passes against the new spec type with only fixture
-construction changed. Any test that needs rewriting (not just re-fixturing) means a risk
-guarantee moved — stop and explain before proceeding.
+~~**Gate:** the MT5 repo's `sizing` test suite passes against the new spec type with only
+fixture construction changed. Any test that needs rewriting (not just re-fixturing) means a
+risk guarantee moved — stop and explain before proceeding.~~ **As actually applied:** this
+stop condition was honored in substance, not literally — the unit-system changes above forced
+real (not fixture-only) changes in `tests/test_sizing.py`, and each one is explained in that
+file's own docstring and in the N4 commit message rather than silently absorbed. The plan text
+just wasn't updated to say so until this audit-fix pass; treat the paragraph above as the
+current source of truth for what N4 actually did.
 
 ### Phase N5 — Strategy + Actor, backtest mode first
 
@@ -533,6 +551,9 @@ must not change at all** — if it does, the adapter boundary leaked.
 | **CONFIRMED (N0, live):** this paper account has no US equities market data entitlement (error 10089 on both live and delayed) | User enables it once in IBKR Account Management before N6; `wit doctor` should detect and report this per-instrument-class rather than fail generically. FX is unaffected — confirmed working with zero subscription |
 | Committee latency blocks the event loop → missed fills/stale data | Off-loop `DecisionProvider` design; async rate limiter, never `time.sleep`; N0 confirms the mechanism before N5 |
 | `tick_value` shim wrong → position sizes off by an order of magnitude | N0's real instrument table; N4's gate is the MT5 sizing suite green on the new spec; first paper order on one instrument, watched |
+| **CONFIRMED (N4 audit):** `InstrumentSpec.value_per_unit` defaults to 1.0, which is silently wrong (understates risk, over-sizes) for a futures-resolved instrument (multiplier != 1) or a non-USD-quote instrument | Watchlist trimmed to the N0-confirmed 8 equities+EURUSD (no metals/index) so 1.0 is correct for everything currently traded; any future addition of a futures/FX-cross instrument must pass an explicit `value_per_unit` at every `spec_for()` call site, not rely on the default — see `instrument_spec.py`'s docstring |
+| `InstrumentSpec.min_stop_distance` defaults to 0.0 (no floor) per instrument — MT5's broker-reported `stops_level_points` had this for free | Must be set per instrument before N6 goes live on real orders; `wit doctor` (N7) should warn when any traded instrument is still at 0.0 |
+| A malformed/crossed live quote (`last_close <= 0`, negative `ask - bid`) reaches `build_plan`/`revalidate_plan` | **CONFIRMED (N4 audit) and fixed:** both functions now block on `last_close <= 0` or a negative `spread` with a dedicated reason string, restoring the fail-closed behavior MT5's non-negative broker-reported spread int provided for free |
 | Silent divergence between old/new desks | N2's byte-identical `as_prompt_block()` fixture gate |
 | IB gateway daily restart leaves the engine blind | `FundStateActor` staleness watchdog; 48h soak spans ≥2 restarts |
 | IB pacing violation disables the API session mid-run | Serialized/staggered warmup, measured in N0 before it's a production surprise |

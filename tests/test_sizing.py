@@ -65,6 +65,20 @@ def test_hold_is_never_approved(desks):
     assert "HOLD" in p.blocked_by[0]
 
 
+def test_low_conviction_is_blocked(desks):
+    """Phase N4 audit finding F4: dropped when this file was first ported —
+    min_conviction is a live gate in build_plan and had zero regression
+    coverage without this."""
+    p = plan_for(decision(conviction=0.1), desks)   # below the 0.15 floor
+    assert not p.approved
+    assert any("below floor" in b for b in p.blocked_by)
+
+
+def test_conviction_above_floor_is_allowed(desks):
+    p = plan_for(decision(conviction=0.6), desks)
+    assert p.approved
+
+
 def test_wide_spread_blocks_the_trade(desks):
     p = plan_for(decision(), desks, spread=0.005)  # ~0.45% of ~1.1 price
     assert not p.approved
@@ -83,7 +97,9 @@ def test_spread_as_percentage_of_price_blocks_a_low_priced_symbol(desks):
     cheap = type(tech)(**{**tech.to_dict(), "last_close": 5.0})
     p = plan_for(decision(), (cheap, aligned_mk, gk), spec=equity_spec, spread=0.10)
     assert not p.approved
-    assert any("spread" in b for b in p.blocked_by)
+    # Specifically the pct gate, not just any spread-related block (there are
+    # now two: the malformed-quote guard and the pct cap) — Phase N4 audit F9.
+    assert any("% of price" in b for b in p.blocked_by)
 
     # The identical absolute spread on a higher-priced symbol clears the cap.
     normal = type(tech)(**{**tech.to_dict(), "last_close": 500.0})
@@ -122,6 +138,37 @@ def test_aligned_markov_regime_allows_the_trade(desks):
 def test_a_blocked_plan_carries_no_size(desks):
     p = plan_for(decision(), desks, spread=0.05)
     assert (p.quantity, p.action, p.risk_amount) == (0.0, "HOLD", 0.0)
+
+
+# ── Malformed-quote guard (Phase N4 audit findings F1, F2) ─────────────────
+# MT5's spread_points was a broker-reported non-negative int, so a broken
+# quote couldn't silently disable the spread gate. spread is now a
+# caller-supplied float (ask - bid) and last_close comes from the technicals
+# desk - both can be garbage (a stale feed, a de-listed contract, a crossed
+# book), and the pct-only spread gate would otherwise fail open on either.
+
+def test_zero_last_close_blocks_rather_than_passing_the_spread_gate(desks):
+    tech, mk, gk = desks
+    aligned = (type(tech)(**{**tech.to_dict(), "last_close": 0.0}),
+              type(mk)(**{**mk.to_dict(), "signal": 0.8}), gk)
+    p = plan_for(decision(), aligned, spread=999.0)
+    assert not p.approved
+    assert any("last_close" in b for b in p.blocked_by)
+    assert p.quantity == 0.0
+
+
+def test_negative_spread_blocks_as_a_crossed_quote(desks):
+    tech, mk, gk = desks
+    aligned = (tech, type(mk)(**{**mk.to_dict(), "signal": 0.8}), gk)
+    p = plan_for(decision(), aligned, spread=-5.0)
+    assert not p.approved
+    assert any("negative" in b for b in p.blocked_by)
+
+
+def test_revalidate_rejects_a_negative_live_spread(desks):
+    p = plan_for(decision(), desks)
+    assert p.approved
+    assert "negative" in revalidate_plan(p, p.entry, p.entry, SPEC, -1.0)
 
 
 # ── Sizing maths ─────────────────────────────────────────────────────────
@@ -191,6 +238,38 @@ def test_broker_minimum_stop_distance_is_respected(desks):
     wide_spec = InstrumentSpec(**{**SPEC.__dict__, "min_stop_distance": 0.25})
     p = plan_for(decision(action="BUY", stop_atr_mult=0.5), aligned, spec=wide_spec)
     assert p.entry - p.stop_loss >= 0.25 * 0.999
+
+
+def test_at_a_plausible_ibkr_fx_minimum_and_realistic_price_sizing_still_clears(desks):
+    """Phase N4 audit finding F5: the shipped fixture's min_quantity=1_000 is
+    permissive (chosen so gate tests aren't incidentally tripped by the
+    sizing floor), and EURUSD's synthetic price in this suite's make_bars
+    output (~2.04, an artifact of the random-walk generator) understates
+    real EURUSD's stop distance relative to a ~1.08 price.
+
+    25,000 units is IDEALPRO's typical minimum per the Phase N0 probe
+    scripts' own comment - NOT yet confirmed via reqContractDetails'
+    minSize/market-rule fields, so this pins today's behavior at that
+    plausible value rather than asserting it as a confirmed fact. Phase N6
+    must verify the real minimum live and adjust RiskConfig.risk_per_trade
+    or this spec if a realistic conviction range can't clear it (the audit's
+    own hand calculation: at neutral GARCH, conviction below ~0.43 would be
+    blocked by the sizing floor on a $50k account at the default 0.5% risk)."""
+    tech, mk, gk = desks
+    realistic = type(tech)(**{**tech.to_dict(), "last_close": 1.08,
+                              "atr": 1.08 * 0.002})  # ~0.20%-of-price H1 ATR
+    aligned = (realistic, type(mk)(**{**mk.to_dict(), "signal": 0.8}), gk)
+    plausible_min = InstrumentSpec(**{**SPEC.__dict__, "min_quantity": 25_000.0})
+
+    p = plan_for(decision(conviction=0.6), aligned, spec=plausible_min)
+    assert p.approved
+    assert p.quantity >= 25_000.0
+
+    # Below the hand-computed clearance point, the sizing floor - not the
+    # conviction floor - is what blocks (RiskConfig.min_conviction is 0.15).
+    blocked = plan_for(decision(conviction=0.2), aligned, spec=plausible_min)
+    assert not blocked.approved
+    assert any("below broker minimum" in b for b in blocked.blocked_by)
 
 
 # ── Post-exit cooldown ───────────────────────────────────────────────────

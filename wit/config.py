@@ -110,7 +110,7 @@ class RiskConfig:
     cooldown_minutes: int = 60           # throttle re-entry on the same symbol
     max_entry_slippage_pct: float = 0.002  # reject at execution if price drifted
     correlation_groups: dict[str, tuple[str, ...]] = field(default_factory=lambda: {
-        "us_tech": ("NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA", "US500"),
+        "us_tech": ("NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA"),
     })
     max_positions_per_group: int = 2
 
@@ -177,8 +177,17 @@ class Config:
     adaptive: AdaptiveConfig = field(default_factory=AdaptiveConfig)
     dream: DreamConfig = field(default_factory=DreamConfig)
 
+    # The build plan's own "Explicitly not doing" list scopes the first watchlist to
+    # US equities + major FX only (no metals/index/futures - "the two classes §1.3's
+    # sizing math can be confident about"). XAUUSD/US500 were carried over from the
+    # MT5 build's watchlist during the N2 config port without checking that against
+    # the plan's own stated scope; trimmed here once Phase N4's audit traced the
+    # consequence: wit/risk/instrument_spec.py's value_per_unit defaults to 1.0,
+    # which is correct for equities/FX but silently wrong (under-sizes the intended
+    # risk by the contract multiplier) for a futures-resolved XAUUSD/US500. Add
+    # metals/index back only alongside an explicit, non-default value_per_unit.
     watchlist: tuple[str, ...] = (
-        "EURUSD", "XAUUSD", "US500",
+        "EURUSD",
         "NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA",
     )
     timeframe: str = "H1"
