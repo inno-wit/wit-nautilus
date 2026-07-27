@@ -239,9 +239,31 @@ than requested — real money reasons to not default a live-order-placing system
 substitution-prone gateway. `served_model` stays logged either way, since it's the only way to
 detect substitution if a gateway is used later.
 
-**Gate:** replay `QuantAnalystReport` fixtures from the MT5 repo's journal through
-`LiveCommitteeProvider`; confirm every failure mode (timeout, malformed tool call, 429, no key)
-returns `abstain` and never raises.
+**Gate:** confirm every failure mode (timeout, malformed tool call, missing required field,
+non-numeric field, 429, no key) returns `abstain` and never raises. **As actually run** (Phase
+N3 audit finding F9): via a stubbed Anthropic client over synthetic `make_bars`-derived
+reports (`tests/test_committee_live.py`), not literal MT5-journal fixtures replayed through a
+live client — the MT5 build's journal doesn't carry raw Anthropic response shapes to replay,
+only the already-parsed `CommitteeDecision`. The failure-mode coverage itself is not weaker for
+it (same sentinels the MT5 suite used: empty content, no tool call, missing key, non-numeric
+field, raised exception), but if a literal journal-replay gate is wanted later, it needs new
+tooling to capture raw API responses, not just decisions.
+
+**Landed via the Phase N3 audit, not in the original design (findings F1-F3, blocking):**
+`LLMConfig.rpm_limit` was missing (the N2 config port dropped it, N3's `live.py` referenced it
+anyway — `LiveCommitteeProvider` could not be constructed until this was fixed); `_RateLimiter`
+and `ReplayCommitteeProvider`'s SQLite connection were not thread-safe, which mattered
+immediately because `run_in_executor` dispatches to a *shared, multi-worker* thread pool (see
+`provider.py`'s docstring) — several symbols' committee calls can run concurrently, not one at
+a time. Both are fixed; **Phase N5 must not reintroduce single-threaded assumptions** when
+wiring `WitStrategy` to a `DecisionProvider`.
+
+**Owed to N5 design (finding F11, non-blocking):** NautilusTrader's kernel sets the committee's
+thread pool as the event loop's *default* executor — every `run_in_executor(None, ...)`
+anywhere in nautilus_trader and the IB adapter draws from the same pool the committee occupies.
+Three sequential Anthropic calls (up to 90s each) per symbol per bar is a long hold on a shared
+resource. Consider registering a dedicated executor for committee work in `WitStrategy`/
+`FundStateActor` rather than relying on the shared default.
 
 ### Phase N4 — Risk/sizing port
 

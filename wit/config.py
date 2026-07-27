@@ -50,6 +50,11 @@ class LLMConfig:
     base_url: str = _env("ANTHROPIC_BASE_URL")  # empty -> Anthropic's default endpoint
     deep_model: str = _env("WIT_DEEP_MODEL")
     quick_model: str = _env("WIT_QUICK_MODEL")
+    # Paces LiveCommitteeProvider's bull/bear/PM calls (wit/committee/live.py's
+    # _RateLimiter). Direct Anthropic accounts have materially higher limits than the
+    # MT5 build's free-tier gateway did, so the default is higher than that build's 10 —
+    # override for your account's actual tier. 0 disables pacing entirely.
+    rpm_limit: int = int(_env("WIT_LLM_RPM_LIMIT", "50") or "50")
 
 
 @dataclass(frozen=True)

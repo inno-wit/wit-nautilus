@@ -8,12 +8,17 @@ model's judgement.
 """
 from __future__ import annotations
 
+import itertools
+import sys
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from tests.conftest import make_bars
 from wit.committee.live import LiveCommitteeProvider, _RateLimiter
+from wit.config import LLMConfig
 from wit.desks import garch, markov, quant_analyst, technicals
 
 PM_VERDICT = {
@@ -261,3 +266,85 @@ def test_committee_researcher_and_pm_calls_share_one_limiter(monkeypatch):
     # is always free.
     assert len(clock.slept) == 2
     assert all(s == pytest.approx(6.0) for s in clock.slept)
+
+
+def test_rate_limiter_serializes_concurrent_callers():
+    """Phase N3 audit finding F3: wait() must hold its lock across the sleep,
+    not just the read-modify-write, or concurrent callers (real, unfaked
+    threads here) compute their delay from the same stale _last_call and wake
+    in a burst instead of being paced apart."""
+    limiter = _RateLimiter(rpm=600)  # 0.1s spacing - fast enough for a real test
+    calls: list[float] = []
+    lock = threading.Lock()
+
+    def worker():
+        limiter.wait()
+        with lock:
+            calls.append(time.monotonic())
+
+    threads = [threading.Thread(target=worker) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    calls.sort()
+    gaps = [b - a for a, b in itertools.pairwise(calls)]
+    assert all(gap >= 0.08 for gap in gaps), (
+        f"calls were not serialized apart: gaps={gaps}"
+    )
+
+
+# ── __init__ construction (Phase N3 audit finding F1) ─────────────────────
+# build_committee() above bypasses __init__ via __new__ for every other test
+# in this file, which is how a broken rpm_limit reference on a real LLMConfig
+# survived to a commit: nothing ever exercised construction. These do.
+
+def test_init_constructs_a_real_client_and_wires_the_limiter(monkeypatch):
+    created = {}
+
+    class FakeAnthropic:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    monkeypatch.setitem(sys.modules, "anthropic", SimpleNamespace(Anthropic=FakeAnthropic))
+
+    llm = LLMConfig(api_key="test-key", deep_model="d", quick_model="q", rpm_limit=30)
+    provider = LiveCommitteeProvider(llm=llm, timeframe="H1")
+
+    assert created["api_key"] == "test-key"
+    assert "base_url" not in created  # empty base_url must not be forwarded
+    assert isinstance(provider._limiter, _RateLimiter)
+    assert provider._limiter._min_interval == pytest.approx(2.0)  # 60/30
+
+
+def test_init_rejects_a_missing_api_key():
+    llm = LLMConfig(api_key="", deep_model="d", quick_model="q")
+    with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
+        LiveCommitteeProvider(llm=llm)
+
+
+def test_init_rejects_missing_models():
+    llm = LLMConfig(api_key="test-key", deep_model="", quick_model="")
+    with pytest.raises(ValueError, match="WIT_DEEP_MODEL"):
+        LiveCommitteeProvider(llm=llm)
+
+
+# ── Malformed tool-call payload (Phase N3 audit finding F10) ──────────────
+
+def test_pm_tool_call_missing_a_required_key_abstains(report):
+    """The gate names this failure mode explicitly: a tool_use block whose
+    input is missing a required field (e.g. a truncated/malformed response)
+    must abstain, not raise KeyError out of decide()."""
+    incomplete = {k: v for k, v in PM_VERDICT.items() if k != "risk_rating"}
+    d = build_committee(incomplete).decide(report)
+    assert d.action == "HOLD"
+    assert d.conviction == 0.0
+    assert "risk_rating" in d.error
+
+
+def test_pm_tool_call_non_numeric_conviction_abstains(report):
+    bad = {**PM_VERDICT, "conviction": "not-a-number"}
+    d = build_committee(bad).decide(report)
+    assert d.action == "HOLD"
+    assert d.error is not None

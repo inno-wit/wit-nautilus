@@ -5,12 +5,30 @@ backtest, paper, and live (build plan §1.2).
 deliberate simplification versus the build plan's original draft (written
 before Phase N0 confirmed how a NautilusTrader ``Strategy``/``Actor`` runs
 off-loop work): ``run_in_executor``/``queue_for_executor`` take a regular
-callable and dispatch it to a registered thread-pool executor in live mode,
-calling it directly (synchronously) in backtest. A synchronous
+callable and dispatch it to a registered thread-pool executor. A synchronous
 ``anthropic.Anthropic`` client blocking a worker thread is exactly as safe as
 an async client there — it never touches the event loop either way — so
 ``LiveCommitteeProvider`` stays a near-verbatim, lower-risk port of the MT5
 build's ``Committee`` rather than an async rewrite with no off-loop benefit.
+
+**The precondition isn't "live vs. backtest"** — the Phase N3 audit (finding
+F8) traced this into ``nautilus_trader`` 1.230.0's actual source: the branch
+is ``if self._executor is None: call inline`` (``actor.pyx``), and the
+executor is registered exactly once, when the kernel starts
+(``kernel.py``'s ``_register_executor()`` during ``start_async``). The
+standard ``TradingNode``/``BacktestEngine`` paths always register one before
+any strategy runs, which is why "live dispatches off-loop, backtest runs
+inline" holds in practice — but an actor/strategy added to the trader
+*after* the kernel has already started would never receive the registration,
+and its ``run_in_executor`` calls would then run inline on the event-loop
+thread regardless of live/backtest mode. Phase N5/N6 must add strategies
+before ``node.build()``/kernel start, not after.
+
+Because the executor is a shared thread pool (not one worker per strategy),
+``LiveCommitteeProvider`` and ``ReplayCommitteeProvider`` must be safe to
+call from multiple threads concurrently — see their own docstrings for how
+each handles it (a locked rate limiter; a SQLite connection opened with
+``check_same_thread=False`` plus a lock around every read/write).
 See docs/BUILD_PLAN.md Phase N3.
 """
 from __future__ import annotations

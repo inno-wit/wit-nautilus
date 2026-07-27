@@ -12,6 +12,7 @@ detect substitution if a gateway is used later.
 """
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
@@ -40,20 +41,33 @@ class _RateLimiter:
     unreachable in the common case rather than hoping SDK retries cover for
     it — a rate-limit abstain looks identical in the journal to a genuine
     no-edge decision.
+
+    ``wait()`` holds a lock across its own read-sleep-write, not just the
+    read-modify-write: the MT5 build never needed this (single-threaded), but
+    a ``DecisionProvider`` here is invoked via NautilusTrader's
+    ``run_in_executor``, which dispatches to a multi-worker thread pool —
+    several symbols can deliberate concurrently against one shared limiter
+    instance. Locking only the read-modify-write of ``_last_call`` would still
+    let concurrent callers compute their delay from the same stale timestamp
+    and wake in a burst; holding the lock across the sleep makes the limiter a
+    genuine serialization point, which is the correct semantics for an
+    account-wide budget (see the Phase N3 audit, finding F3).
     """
 
     def __init__(self, rpm: int):
         self._min_interval = 60.0 / rpm if rpm > 0 else 0.0
         self._last_call: float | None = None
+        self._lock = threading.Lock()
 
     def wait(self) -> None:
         if self._min_interval <= 0:
             return
-        if self._last_call is not None:
-            remaining = self._min_interval - (time.monotonic() - self._last_call)
-            if remaining > 0:
-                time.sleep(remaining)
-        self._last_call = time.monotonic()
+        with self._lock:
+            if self._last_call is not None:
+                remaining = self._min_interval - (time.monotonic() - self._last_call)
+                if remaining > 0:
+                    time.sleep(remaining)
+            self._last_call = time.monotonic()
 
 
 class LiveCommitteeProvider:
