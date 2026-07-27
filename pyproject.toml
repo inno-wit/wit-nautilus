@@ -1,0 +1,46 @@
+[project]
+name = "wit-nautilus"
+version = "0.1.0"
+description = "Wit Hedge Fund's LLM committee + risk pipeline, ported to NautilusTrader over Interactive Brokers"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# Pinned precisely once Phase N0 confirms the nautilus_trader version + IB extra syntax.
+ib = [
+    "nautilus_trader",
+    "anthropic>=0.40",
+    "pandas>=2.0",
+    "numpy>=1.26",
+    "arch>=6.3",
+    "scipy>=1.11",
+    "yfinance>=0.2",
+]
+research = [
+    "vectorbt",
+    "jupyter",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["wit"]
+
+[project.scripts]
+wit = "wit.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

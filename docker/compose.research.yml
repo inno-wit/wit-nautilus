@@ -1,0 +1,13 @@
+# vectorbt research image — separate Compose profile, never part of default `docker compose up`.
+# Run explicitly: docker compose -f docker/compose.yml -f docker/compose.research.yml --profile research up
+# Completed alongside Phase N8; the [research] extra is intentionally kept out of docker/Dockerfile.
+#
+# services:
+#   research:
+#     build:
+#       context: ..
+#       dockerfile: docker/Dockerfile.research   # TODO(N8): separate target, installs [research]
+#     profiles: [research]
+#     volumes:
+#       - ../data:/app/data
+#       - ../notebooks:/app/notebooks

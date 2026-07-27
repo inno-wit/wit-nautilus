@@ -1,0 +1,32 @@
+# Placeholder — completed in Phase N8 (docker/compose on the VPS), after Phase N0/N6
+# confirm the IB Gateway image pin and paper-login flow. Shape matches the build plan's
+# §Phase N8: ib-gateway + fund, both on an internal network, no ports published except
+# a loopback-bound VNC for one-time login/2FA.
+#
+# services:
+#   ib-gateway:
+#     image: ghcr.io/gnzsnz/ib-gateway:stable   # TODO(N0/N8): pin by digest
+#     environment:
+#       TRADING_MODE: paper
+#       TZ: UTC
+#     ports:
+#       - "127.0.0.1:5900:5900"   # VNC, reach over an SSH tunnel only
+#     networks: [internal]
+#     restart: unless-stopped
+#
+#   fund:
+#     build:
+#       context: ..
+#       dockerfile: docker/Dockerfile
+#     depends_on:
+#       ib-gateway:
+#         condition: service_healthy
+#     env_file: ../.env
+#     volumes:
+#       - ../data:/app/data
+#     networks: [internal]
+#     restart: unless-stopped
+#     command: ["paper"]   # added in Phase N6/N7
+#
+# networks:
+#   internal:
