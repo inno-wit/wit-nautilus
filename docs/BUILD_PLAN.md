@@ -160,20 +160,30 @@ Nautilus version's actual API. Answers needed, in priority order:
 2. **Async work from a `Strategy`.** Docs say user code must return quickly but don't document
    the sanctioned way to launch/await background work. **This is the single most important
    unknown in the whole plan** — the off-loop committee design (§1.2) depends on the answer.
-3. **Instrument resolution table.** `InteractiveBrokersInstrumentProviderConfig` for the full
-   watchlist — record `price_increment`/`min_quantity`/`lot_size`/`multiplier`/`margin_init`
-   per symbol. This is the direct input to the §1.3 `tick_value` shim; don't design that shim
-   before this table exists.
-4. **Historical warmup at scale.** 750×15m bars across 10 instruments at `on_start` — does it
-   trip IB's pacing limiter? Does concurrent multi-strategy warmup hit the shared
-   historical-request de-dup bug reported in nautechsystems/nautilus_trader#3718?
-5. Live bar cadence/latency on `on_bar`.
-6. Bracket order behavior (entry+SL+TP as one list) — fill/contingency semantics on partial fill.
-7. **Daily gateway restart (~21:00–21:15 UTC) resubscription.** Issue #3733 (closed) fixed this
-   for a specific version — confirm the fix is actually in the version being pinned.
-8. Clock timer (`set_timer`/`set_time_alert`) parity between live and backtest.
-9. Paper market-data subscription behavior — does paper share live's data subscriptions, or is
-   `DELAYED_FROZEN` the fallback? MVP should work on delayed data if not.
+3. **DONE (live probe, `reqContractDetails`).** All 7 equities + EURUSD resolve cleanly;
+   equities are trivially `minTick=0.01`/`priceMagnifier=1`. See §4 item 10 for the full table.
+4. **Partially done.** A single-symbol 260-bar/15m request completed in 1.3s with no pacing
+   issue — but this doesn't clear the *concurrent* 10-instrument case (issue #3718's actual
+   failure mode). Retest once N5's strategy code exists to drive 10 real concurrent requests.
+5. **Not yet tested** — needs a live bar subscription running for at least one bar interval,
+   which is more naturally done alongside N5's strategy code than as an isolated probe.
+6. **DONE (live probe, raw `placeOrder`).** Bracket order (parent LMT + child LMT-TP + child
+   STP-SL) placed on `EURUSD` paper, away from market so it rested rather than filled. IB
+   correctly linked both children to the parent via `parentId`, accepted all three, and
+   cancelled cleanly. Confirms the parent/child linkage `OrderFactory.bracket()` relies on
+   works as expected. Fill behavior itself (not just acceptance) gets its real test in N9 step 6
+   ("first paper order, watched") — deliberately not forced here.
+7. **Not yet tested** — needs to be observed across an actual ~21:00–21:15 UTC window with a
+   live subscription running, so this is an N8/N9 soak finding, not a five-minute probe.
+8. **Not yet tested** — same reasoning as 7, needs N5's strategy code to drive both a live and
+   backtest timer through the same callback.
+9. **DONE, and it's an action item for the account, not code.** Both `LIVE` and `DELAYED`
+   market data types failed with error 10089 for equities (`NVDA`/`SMART`/`NASDAQ`) — this
+   paper account has **no US equities market data entitlement at all** yet, not even the free
+   delayed tier. **FX is unaffected** — `EURUSD`/`IDEALPRO` returned live ticks immediately,
+   zero subscription needed. Action before N6: enable equities market data in IBKR Account
+   Management (delayed is free and enough for N9's early gates). See §4 item 9 and the Risks
+   table for the full writeup.
 
 ### Phase N1 — Repo scaffold
 
