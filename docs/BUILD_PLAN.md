@@ -384,8 +384,31 @@ here, before `node.build()`. **Don't use `DockerizedIBGatewayConfig`** on the VP
 Docker socket mounted into the trading container for no benefit when Compose can own the
 gateway's lifecycle directly; use explicit host/port against a sibling `ib-gateway` service.
 
-**Gate:** node connects, instruments resolve, warmup+live bars arrive, one bracket order fills
-on paper and appears in the journal with a Nautilus position id.
+**As shipped (`wit/nautilus/node_live.py`):** `assert_paper_only()` checks `WIT_PAPER_ONLY`,
+`IBG_PORT` (must be 7497 TWS-paper or 4002 Gateway-paper — 7496/4001 are refused unconditionally),
+and `TWS_ACCOUNT`'s `DU` prefix, all before any socket opens. `build_config()` registers one IB
+data client + one IB exec client, with an empty `strategies=[]`/`actors=[]` — per N5 audit
+finding F9, `WitStrategy`/`FundStateActor` are added manually via
+`node.trader.add_actor()`/`add_strategy()` after `node.build()`, since Nautilus's config-driven
+`StrategyFactory` can't construct a class that needs a live `DecisionProvider`/`FundStateActor`
+reference. The account is registered under IB's own fixed pseudo-venue (`IB_VENUE` =
+`"INTERACTIVE_BROKERS"`, confirmed against the installed adapter) — separate from the
+per-instrument routing venues (`SMART` for equities, `IDEALPRO` for FX) — so `FundStateActor`
+sees one fund-wide equity figure across both asset classes, not a partial per-exchange view.
+`INSTRUMENT_IDS` maps the N0-confirmed 8-symbol watchlist to Nautilus/IB instrument-id strings
+directly (no dynamic resolution yet — matches the plan's "no options, futures, or crypto" scope).
+
+**Gate: NOT YET RUN.** Node connects, instruments resolve, warmup+live bars arrive, one bracket
+order fills on paper and appears in the journal with a Nautilus position id. This requires a
+real, watched connection to the user's TWS/Gateway paper session — confirmed reachable
+(port 7497) during this phase, but deliberately not attempted unattended: it's the first point
+in the whole build where code would actually talk to a live (even if paper) brokerage connection
+and could place a real order, which crosses from "write and test code" into "operate a connected
+trading system" — exactly the kind of action that warrants an explicit go-ahead rather than
+proceeding autonomously. `.env` also isn't fully populated yet (`TWS_ACCOUNT` is blank in the
+current `.env`, confirmed while building this phase). Everything up to that boundary
+(`assert_paper_only`, `build_config`, `build_strategies`) has real test coverage
+(`tests/test_node_live.py`) and needs no live connection to verify.
 
 ### Phase N7 — CLI, journal, reflection, dream, alerts
 
