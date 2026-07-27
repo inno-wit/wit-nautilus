@@ -1,22 +1,42 @@
-"""Dream cycle state — the fund's weekly self-review (state layer only, Phase N2).
+"""Dream cycle — the fund's weekly self-review.
 
-``DreamState``/``Lesson``/``LessonScore``/``load``/``save`` are pulled forward
-from Phase N7 because ``wit/desks/quant_analyst.py`` embeds the latest
-``DreamState`` in the committee's prompt context (one more prior the PM weighs,
-never a parameter this loop can change itself). The orchestration half of the
-original module (``run``, ``format_digest``, the LLM call, journal/reflection
-wiring) lands in Phase N7 on top of this file.
+The state layer (``DreamState``/``Lesson``/``LessonScore``/``load``/``save``)
+landed in Phase N2 because ``wit/desks/quant_analyst.py`` embeds the latest
+``DreamState`` in the committee's prompt context (one more prior the PM
+weighs, never a parameter this loop can change itself). This module now adds
+the orchestration half (Phase N7): ``run()`` (the weekly LLM call, wired to
+``Reflection``/``Journal``) and ``format_digest()``.
 
-Ported from ``Wit-Hedge-fund/engine/dream.py``.
+Two guardrails make this safe to run on a watchlist this small (ported
+verbatim from ``Wit-Hedge-fund/engine/dream.py``):
+
+  1. Hard per-bucket sample floor, enforced in code. ``_qualifying_buckets``
+     filters Reflection's breakdown down to buckets with enough trades
+     *before* the LLM ever sees the data, and the LLM is not trusted to
+     report trade counts/win rates itself — it only names which bucket a
+     lesson is about; the real numbers are filled in here. A lesson naming a
+     bucket it was never shown is dropped, not saved.
+  2. Lesson efficacy tracking. Every lesson is scoped to exactly one
+     ``(dimension, key)`` bucket and gets a stable id, so the *next* dream
+     cycle can look up that same bucket in the newly computed Reflection
+     breakdown and report, factually, what happened since.
 """
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 
-from wit.config import CONFIG
+from wit.config import CONFIG, DreamConfig
+from wit.ops.reflection import Reflection
+
+if TYPE_CHECKING:
+    from wit.ops.journal import Journal
+
+_DIMENSIONS = ("symbol", "markov_regime", "vol_regime", "conviction")
 
 
 @dataclass(frozen=True)
@@ -123,3 +143,178 @@ def save(state: DreamState, path: str | Path | None = None) -> None:
     path = Path(path or CONFIG.dream.state_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
+
+
+# ── Guardrails ───────────────────────────────────────────────────────────
+
+
+def _qualifying_buckets(review: dict[str, Any], min_trades: int) -> dict[str, dict[str, dict]]:
+    """The hard sample floor: only buckets with enough trades to say
+    anything meaningful ever reach the LLM. A dimension with nothing
+    qualifying is omitted entirely rather than sent as an empty dict."""
+    out: dict[str, dict[str, dict]] = {}
+    for dim in _DIMENSIONS:
+        buckets = review.get(f"by_{dim}", {})
+        qualifying = {k: v for k, v in buckets.items() if v.get("trades", 0) >= min_trades}
+        if qualifying:
+            out[dim] = qualifying
+    return out
+
+
+def _score_previous_lessons(previous: DreamState, review: dict[str, Any]) -> list[LessonScore]:
+    """Look up each of the previous cycle's lessons in the newly computed
+    review — no extra journal scanning needed, this cycle already computed
+    the numbers for its own window."""
+    scores = []
+    for lesson in previous.lessons:
+        bucket = review.get(f"by_{lesson.dimension}", {}).get(lesson.key)
+        trades_since = bucket.get("trades", 0) if bucket else 0
+        scores.append(LessonScore(
+            lesson_id=lesson.lesson_id, lesson=lesson.lesson,
+            dimension=lesson.dimension, key=lesson.key,
+            basis_trades=lesson.basis_trades, basis_win_rate=lesson.basis_win_rate,
+            trades_since=trades_since,
+            win_rate_since=bucket["win_rate"] if trades_since else None,
+            pnl_since=bucket["total_pnl"] if trades_since else None,
+        ))
+    return scores
+
+
+def _build_lessons(raw: list[dict[str, Any]], qualifying: dict[str, dict[str, dict]]) -> list[Lesson]:
+    """Turn the LLM's raw ``{lesson, dimension, key, confidence}`` dicts into
+    validated ``Lesson``s. A lesson naming a bucket outside ``qualifying`` —
+    one it was never shown, i.e. a hallucinated key — is dropped rather than
+    trusted."""
+    lessons = []
+    for item in raw:
+        dim, key = item.get("dimension"), item.get("key")
+        bucket = qualifying.get(dim, {}).get(key)
+        if bucket is None:
+            continue
+        lessons.append(Lesson(
+            lesson_id=uuid.uuid4().hex[:8],
+            lesson=str(item.get("lesson", "")).strip(),
+            dimension=dim, key=key,
+            confidence=item.get("confidence", "low"),
+            basis_trades=bucket["trades"], basis_win_rate=bucket["win_rate"],
+            basis_avg_pnl=bucket["avg_pnl"],
+        ))
+    return lessons
+
+
+# ── Orchestration ────────────────────────────────────────────────────────
+
+
+class DreamCommittee(Protocol):
+    def dream(
+        self, qualifying: dict[str, dict[str, dict]], scores: list[dict[str, Any]],
+        window_days: int, min_bucket_trades: int,
+    ) -> list[dict[str, Any]]: ...
+
+
+class PositionsCache(Protocol):
+    """Duck-types Nautilus's ``Cache`` for the one method this module needs
+    - ``wit/nautilus/actor.py``'s ``FundStateActor`` passes ``self.cache``
+    directly; tests can pass anything with the same shape."""
+
+    def positions_closed(self) -> list[Any]: ...
+
+
+def pnl_by_position(cache: PositionsCache, since: datetime) -> dict[str, float]:
+    """Realized P&L per closed position id since ``since`` - the Nautilus
+    equivalent of the MT5 build's ``broker.deals_pnl_by_entry_ticket()``.
+    Mirrors ``FundStateActor._realized_pnl_since``'s unfiltered
+    ``positions_closed()`` query (Phase N6 audit finding F3): this system
+    runs one executor per broker account, so every closed position in the
+    cache belongs to this fund regardless of which instrument venue it
+    traded on."""
+    since_ns = int(since.timestamp() * 1_000_000_000)
+    out: dict[str, float] = {}
+    for pos in cache.positions_closed():
+        if pos.ts_closed is not None and pos.ts_closed >= since_ns and pos.realized_pnl is not None:
+            out[str(pos.id)] = float(pos.realized_pnl)
+    return out
+
+
+def run(
+    committee: DreamCommittee, cache: PositionsCache, journal: Journal,
+    cfg: DreamConfig | None = None, now: datetime | None = None,
+) -> DreamState:
+    """One weekly self-review. Never raises internally - every step already
+    degrades gracefully on its own (empty buckets, a bad LLM call, a missing
+    prior state) - but the caller (``FundStateActor``'s weekly timer) still
+    wraps this defensively, matching the MT5 build's scheduler posture.
+
+    ``now`` must be the caller's own clock, not a bare ``datetime.now(UTC)``
+    default - ``pnl_by_position``'s cutoff has to sit in the same time
+    domain as ``pos.ts_closed``, which is *simulated* time in a backtest
+    (the Phase N5 audit's F1/F3 class of bug: wall-clock "now" is months
+    away from the bars actually being processed). ``FundStateActor``'s
+    weekly timer passes ``self.clock.utc_now()``; the default here only
+    exists for a manual/CLI invocation with no clock of its own.
+    """
+    cfg = cfg or CONFIG.dream
+    now = now or datetime.now(UTC)
+    previous = load(cfg.state_path)
+
+    since = now - timedelta(days=cfg.window_days)
+    pnl_map = pnl_by_position(cache, since)
+    review = Reflection(journal).review(pnl_map, days=cfg.window_days)
+
+    scores = _score_previous_lessons(previous, review) if previous.lessons else []
+    qualifying = _qualifying_buckets(review, cfg.min_bucket_trades)
+
+    if qualifying:
+        raw = committee.dream(
+            qualifying, [s.to_dict() for s in scores],
+            cfg.window_days, cfg.min_bucket_trades,
+        )
+        lessons = _build_lessons(raw, qualifying)
+    else:
+        lessons = []
+
+    state = DreamState(
+        dream_id=uuid.uuid4().hex[:12],
+        generated_at=now.isoformat(),
+        window_days=cfg.window_days,
+        decisions_considered=review["decisions_considered"],
+        trades_scored=review["trades_scored"],
+        lessons=lessons,
+        scores=scores,
+    )
+    save(state, cfg.state_path)
+    journal.log_event(
+        "dream_cycle",
+        f"{len(lessons)} lesson(s), {len(scores)} prior lesson(s) scored",
+        **state.to_dict(),
+    )
+    return state
+
+
+# ── Telegram digest ──────────────────────────────────────────────────────
+
+
+def format_digest(state: DreamState) -> str:
+    head = f"== Dream cycle · {state.generated_at[:10]} · trailing {state.window_days}d =="
+    lines = [head, (f"{state.trades_scored} trade(s) scored, "
+                    f"{state.decisions_considered} decision(s) considered")]
+
+    if state.scores:
+        lines.append("\nLast cycle's lessons, checked against what happened since:")
+        for s in state.scores:
+            since_txt = (f"{s.trades_since} trades, {s.win_rate_since:.0%} win rate"
+                        if s.trades_since else "no trades in this bucket since")
+            lines.append(f"  - \"{s.lesson}\" -> {since_txt}")
+
+    if state.lessons:
+        lines.append("\nNew lessons:")
+        for l in state.lessons:
+            lines.append(
+                f"  [{l.confidence}] {l.lesson}\n"
+                f"    ({l.dimension}={l.key}, {l.basis_trades} trades, "
+                f"{l.basis_win_rate:.0%} win rate)"
+            )
+    else:
+        lines.append("\nNo new lessons this cycle — no bucket had enough "
+                     "trades to say anything meaningful.")
+    return "\n".join(lines)

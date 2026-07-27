@@ -483,6 +483,65 @@ build's — connectivity, all-watchlist instrument resolution, one LLM round-tri
 state), `backtest`/`sweep`, `paper`/`live` (`live` requires an explicit `--i-know` flag),
 `halt`/`resume`/`status`/`reconcile`.
 
+**As shipped:** the RSI clamp landed exactly as specced (`wit/desks/technicals.py`) — a
+zero-loss window now reports 50.0, not a bare NaN. `wit/ops/reflection.py`'s join is a real
+two-step, not the one-step the MT5 ticket ever needed: a decision only carries a
+`client_order_id` at journal time, and Nautilus doesn't reveal the `position_id` it opened
+until `on_order_filled` fires, later, asynchronously — so `review()` resolves
+`client_order_id -> position_id` from the journal's own `order_filled` events first, then
+joins that to the caller-supplied `pnl_by_position` (built from `cache.positions_closed()` in
+`wit/ops/dream.py`'s new `pnl_by_position()`). `dream.py`'s `run()`/`format_digest()` landed
+per spec, with one addition the spec didn't anticipate: `run()` takes an explicit `now`
+argument rather than reading `datetime.now(UTC)` itself — the Phase N5 audit's F1/F3 bug class
+(wall-clock time leaking into simulated-time code) resurfaced here, caught by a real multi-day
+backtest test, not inspection. `alerts.py` ported verbatim.
+
+The three cron-equivalents (daily briefing 00:05 UTC, daily review 23:55 UTC, weekly dream
+Sunday 22:30 UTC), stubbed in N5, are now live inside `FundStateActor` — `journal`/`committee`/
+`alerter` are constructor arguments (not `ActorConfig` fields, same reasoning as `WitStrategy`
+keeping `provider`/`fund_state` out of its own config), and each timer self-rearms via
+`Clock.set_timer`'s own `interval`/`start_time` since Nautilus has no APScheduler equivalent.
+Two bugs only a real multi-day `BacktestEngine` run caught, both now regression-tested
+(`tests/test_strategy_backtest.py`): `set_timer`'s default `fire_immediately=False` fires the
+*first* event at `start_time + interval`, not at `start_time` — silently skipping the very
+occurrence `_next_daily`/`_next_weekly` computed (a weekly timer due this Sunday would
+otherwise first fire next Sunday); and `_on_weekly_dream` was reading `CONFIG.dream` directly
+instead of the actor's own `config.dream_state_path`, the exact class of bug
+`kill_switch_file` was hardened against in the N5 audit (finding F4) — every weekly cycle from
+a caller with a custom path (every test, every backtest/sweep) would have silently written the
+real production `data/dream_state.json`. Fractional Kelly (`wit/risk/adaptive.py`, built in N4,
+never wired) is now live too, fed by the same `positions_closed()` window as the daily-loss
+breaker — a strict superset of the prior hard-coded 1.0 multiplier, since `kelly_multiplier()`
+itself returns 1.0 whenever `use_fractional_kelly` is off. `market_intel` is wired into
+`WitStrategy._on_bar_work` behind a new `WitStrategyConfig.enable_market_intel` flag, default
+`False` — a backtest must never depend on a live yfinance/Finnhub call for determinism (the
+MT5 build had the same split: `orchestrator.py`'s live cycle called it, `backtest.py` never
+imported it at all); `node_live.py`'s `build_strategies()` turns it on for live/paper only.
+Also fixed in this phase: `build_node()`'s `FundStateActor` construction referenced
+`CONFIG.dream_state_path`, which doesn't exist on `Config` (only `CONFIG.dream.state_path`) —
+an `AttributeError` on every real boot, caught by actually calling `build_node()` with fake
+env vars rather than trusting the existing tests, none of which exercise that function.
+
+**CLI, as shipped — narrower than specced, deliberately:** `doctor` gained a real LLM
+round-trip (mirrors the MT5 build's) plus kill-switch state; `halt`/`resume`/`status` operate
+the kill-switch file directly (the same file `FundStateActor` polls); `review`/`dream` fire
+`Reflection`/`dream.run()` manually against the journal, taking realized P&L from an optional
+`--pnl-json` file since there's no broker connection to pull it from outside a running node;
+`paper`/`live` boot `node_live.run()`, `live` gated by `--i-know`. **Not built this phase:
+`backtest`/`sweep`, and a live-connected `doctor`/`reconcile`.** The MT5 CLI's `backtest`
+pulled bars from `MT5Adapter.candles()`; wit-nautilus has no equivalent historical-bars source
+yet (no data-fetch subsystem exists — this is new infrastructure, not a port, comparable in
+scope to its own phase, not a CLI afterthought). A live IB connectivity/instrument-resolution
+check inside `doctor`, and a broker-side `reconcile`, both need an actual TWS/Gateway
+connection to mean anything — the same "read-only introspection is not operation" boundary the
+N6 audit drew, but connectivity/instrument-resolution *is* read-only and safe to build; it was
+deferred here for a narrower reason: getting the async connect/disconnect lifecycle right
+without a live session to verify against risks shipping the exact kind of unverified,
+confidently-committed live-path code the N6 audit criticized. Nautilus's own exec-engine
+reconciliation already runs automatically on every `node.run()` connect
+(`LiveExecEngineConfig(reconciliation=True)`, confirmed in N6). Both remain Phase N9's attended
+gate, the same way N6 itself deferred `node.run()` rather than guess at it unverified.
+
 ### Phase N8 — Docker / Compose on the VPS
 
 Docker Engine + Compose plugin, `ufw` allowing only 22, non-root user in the docker group (SSH

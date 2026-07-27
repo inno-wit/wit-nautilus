@@ -11,24 +11,59 @@ in the MT5 build, now computed on a timer instead of once per watchlist loop
 (Nautilus has no "cycle"; bars arrive per-instrument, asynchronously).
 
 The three cron-equivalents from the build plan (daily briefing 00:05 UTC,
-daily review 23:55 UTC, weekly dream Sunday 22:30 UTC) are scheduled here but
-their bodies are stubs pending Phase N7's `reflection.py`/`dream.py`
-orchestration half — `wit/ops/dream.py`'s *state* layer already exists
-(Phase N2), so `dream_state` is loaded and exposed now, but nothing yet
-*recomputes* it. Timer firing is exercised in tests; the reflection/dream
-call it will eventually make is not (there is nothing to call yet).
+daily review 23:55 UTC, weekly dream Sunday 22:30 UTC) are scheduled here
+(Phase N7), each self-rearming via `Clock.set_timer`'s own `interval`/
+`start_time` rather than an external scheduler — Nautilus has no APScheduler
+equivalent, and `self.clock` already gives every timer simulated time in a
+backtest, real time live, for free. `journal`/`committee`/`alerter` are
+plain Python constructor arguments, not `ActorConfig` fields, for the same
+reason `WitStrategy` keeps `provider`/`fund_state` out of its config — they
+are live objects (an LLM client, a file-backed journal), not the kind of
+thing `NautilusConfig` (msgspec) is meant to serialize. `committee` is
+optional and duck-typed to `dream.DreamCommittee` (only
+`LiveCommitteeProvider` implements `.dream()` today — `StubPolicyProvider`/
+`ReplayCommitteeProvider` don't, so backtests/sweeps that construct this
+actor without one simply skip the weekly cycle rather than raise).
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from nautilus_trader.common.actor import Actor, ActorConfig
 from nautilus_trader.model.identifiers import Venue
 
 from wit.config import CONFIG
 from wit.ops import dream as dream_mod
+from wit.ops.alerts import Alerter
+from wit.ops.journal import Journal
+from wit.ops.reflection import Reflection
 from wit.risk import adaptive
+
+if TYPE_CHECKING:
+    from wit.ops.dream import DreamCommittee
+
+
+def _next_daily(now: datetime, hour: int, minute: int) -> datetime:
+    """The next occurrence of ``hour:minute`` UTC at or after ``now`` -
+    strictly after if ``now`` already sits exactly on it, so a timer never
+    fires twice for the same moment."""
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _next_weekly(now: datetime, weekday: int, hour: int, minute: int) -> datetime:
+    """The next occurrence of ``weekday`` (Monday=0 .. Sunday=6) at
+    ``hour:minute`` UTC at or after ``now``."""
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    candidate += timedelta(days=(weekday - candidate.weekday()) % 7)
+    if candidate <= now:
+        candidate += timedelta(days=7)
+    return candidate
 
 
 class FundStateActorConfig(ActorConfig, frozen=True):
@@ -47,7 +82,13 @@ class FundStateActorConfig(ActorConfig, frozen=True):
 
 
 class FundStateActor(Actor):
-    def __init__(self, config: FundStateActorConfig) -> None:
+    def __init__(
+        self,
+        config: FundStateActorConfig,
+        journal: Journal | None = None,
+        committee: DreamCommittee | None = None,
+        alerter: Alerter | None = None,
+    ) -> None:
         super().__init__(config)
         self._kill_switch_path = Path(config.kill_switch_file)
         self._halted = False
@@ -57,6 +98,9 @@ class FundStateActor(Actor):
         self._start_of_day_equity: float | None = None
         self._day: object | None = None
         self.dream_state = dream_mod.load(config.dream_state_path or None)
+        self.journal = journal or Journal(CONFIG.journal_path)
+        self.committee = committee
+        self.alerter = alerter or Alerter.from_env()
 
     # -- lifecycle -----------------------------------------------------------
     def on_start(self) -> None:
@@ -66,12 +110,104 @@ class FundStateActor(Actor):
             interval=timedelta(seconds=self.config.poll_interval_seconds),
             callback=self._on_poll_timer,
         )
+        now = self.clock.utc_now()
+        # fire_immediately=True on all three: set_timer's default fires the
+        # FIRST event at start_time + interval, not at start_time itself
+        # (confirmed against the installed nautilus_trader - without this,
+        # the computed "next occurrence" is silently skipped once, e.g. a
+        # weekly timer due this Sunday would instead first fire next
+        # Sunday). With it, start_time is exactly the next real occurrence
+        # _next_daily/_next_weekly computed, and every occurrence after
+        # that is start_time + N * interval.
+        self.clock.set_timer(
+            name="daily_briefing",
+            interval=timedelta(days=1),
+            start_time=_next_daily(now, 0, 5),
+            callback=self._on_daily_briefing,
+            fire_immediately=True,
+        )
+        self.clock.set_timer(
+            name="daily_review",
+            interval=timedelta(days=1),
+            start_time=_next_daily(now, 23, 55),
+            callback=self._on_daily_review,
+            fire_immediately=True,
+        )
+        self.clock.set_timer(
+            name="weekly_dream",
+            interval=timedelta(days=7),
+            # Sunday = weekday 6 (Monday=0). FX is already closed all day
+            # Sunday, so nothing competes with a live trading cycle.
+            start_time=_next_weekly(now, 6, 22, 30),
+            callback=self._on_weekly_dream,
+            fire_immediately=True,
+        )
 
     def on_stop(self) -> None:
-        self.clock.cancel_timer("fund_state_poll")
+        for name in ("fund_state_poll", "daily_briefing", "daily_review", "weekly_dream"):
+            self.clock.cancel_timer(name)
 
     def _on_poll_timer(self, event) -> None:
         self._poll_once()
+
+    # -- daily/weekly cron-equivalents ----------------------------------------
+    def _on_daily_briefing(self, event) -> None:
+        """Morning brief: account state, positions, watchlist, mode. A
+        failure here must not take down the trading strategies, so it only
+        logs (matching the MT5 build's ``FundScheduler.daily_briefing``)."""
+        try:
+            equity = self._read_equity()
+            equity_line = (f"Equity    {equity:,.2f} {self.config.account_currency}"
+                          if equity is not None else "Equity    (unavailable)")
+            open_positions = len(self.cache.positions_open())
+            lines = [
+                f"== Daily briefing · {self.clock.utc_now():%Y-%m-%d} UTC ==",
+                f"Account   {self.config.venue} (PAPER)",
+                equity_line,
+                f"Kill sw   {'ENGAGED' if self._halted else 'clear'}",
+                f"Positions {open_positions}/{CONFIG.risk.max_concurrent_positions}",
+                f"Watchlist {', '.join(CONFIG.watchlist)}",
+            ]
+            self.alerter.send("\n".join(lines))
+        except Exception as e:  # noqa: BLE001 - a briefing outage must not halt trading
+            self.journal.log_event("briefing_error", f"{type(e).__name__}: {e}")
+
+    def _on_daily_review(self, event) -> None:
+        """End-of-day Reflection summary: realized P&L vs. the thesis that
+        opened each closed trade. A failure here must not take down the
+        trading strategies, so it only logs."""
+        try:
+            since = self.clock.utc_now() - timedelta(days=1)
+            pnl_map = dream_mod.pnl_by_position(self.cache, since)
+            review = Reflection(self.journal).review(pnl_map, days=1)
+            self.alerter.send(Reflection.format(review))
+        except Exception as e:  # noqa: BLE001 - a review outage must not halt trading
+            self.journal.log_event("review_error", f"{type(e).__name__}: {e}")
+
+    def _on_weekly_dream(self, event) -> None:
+        """Weekly self-review (build plan Phase N7) — Reflection's aggregate
+        stats become a handful of lessons the committee will weigh, never
+        obey, on future cycles. Skipped (not an error) when no committee
+        capable of ``.dream()`` was wired in - true for every backtest/sweep
+        using ``StubPolicyProvider``/``ReplayCommitteeProvider``."""
+        if self.committee is None or not hasattr(self.committee, "dream"):
+            self.journal.log_event("dream_skipped", "no dream-capable committee configured")
+            return
+        try:
+            # self.config.dream_state_path, not CONFIG.dream.state_path
+            # directly - same reasoning as kill_switch_file having no
+            # fallback default (Phase N5 audit finding F4): a caller that
+            # deliberately set a non-default dream_state_path (every test,
+            # every backtest/sweep) must not have this timer silently write
+            # the real production dream_state.json instead.
+            dream_cfg = replace(CONFIG.dream,
+                               state_path=self.config.dream_state_path or CONFIG.dream.state_path)
+            state = dream_mod.run(self.committee, self.cache, self.journal, dream_cfg,
+                                  now=self.clock.utc_now())
+            self.dream_state = state
+            self.alerter.send(dream_mod.format_digest(state))
+        except Exception as e:  # noqa: BLE001 - a dream-cycle outage must not halt trading
+            self.journal.log_event("dream_error", f"{type(e).__name__}: {e}")
 
     def _poll_once(self) -> None:
         self._check_kill_switch()
@@ -187,12 +323,24 @@ class FundStateActor(Actor):
                 f"{self._start_of_day_equity:.2f} (cap {CONFIG.risk.max_daily_loss:.1%})"
             )
 
-        # Fractional Kelly needs a closed-trade P&L history; that's the
-        # journal's job (wit/ops/journal.py), wired once N7's reflection
-        # aggregation lands. Off (1.0) until then regardless of the config
-        # flag - a silent no-op is safer than a Kelly multiplier computed
-        # from no data.
-        self._kelly_mult = 1.0
+        # Fractional Kelly needs a closed-trade P&L history - wired here now
+        # that N7's reflection aggregation exists. kelly_multiplier() itself
+        # returns 1.0 (no effect) whenever use_fractional_kelly is off or the
+        # sample is under kelly_min_trades, so this is a strict superset of
+        # the prior hard-coded 1.0 when the feature flag stays at its
+        # default. Unfiltered positions_closed(), same reasoning as
+        # _realized_pnl_since above: one FundStateActor per broker account.
+        lookback_ns = int(
+            (now - timedelta(days=acfg.kelly_lookback_days)).timestamp() * 1_000_000_000
+        )
+        pnls = [
+            float(pos.realized_pnl) for pos in self.cache.positions_closed()
+            if pos.ts_closed is not None and pos.ts_closed >= lookback_ns
+            and pos.realized_pnl is not None
+        ]
+        self._kelly_mult = adaptive.kelly_multiplier(
+            adaptive.kelly_stats(pnls), CONFIG.risk.risk_per_trade, acfg,
+        )
 
     def size_multipliers(self) -> tuple[float, float]:
         return self._kelly_mult, self._drawdown_mult

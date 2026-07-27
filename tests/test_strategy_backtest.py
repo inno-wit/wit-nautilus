@@ -23,6 +23,8 @@ second init entirely and all three tests pass together reliably.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
 from nautilus_trader.common.config import LoggingConfig
@@ -208,3 +210,148 @@ def test_fund_state_day_rollover_tracks_simulated_time_not_wall_clock(engine_set
         f"expected the actor's tracked day to land in Jan 2026 (simulated time "
         f"the bars actually occupy), got {final_day} - looks like wall-clock time leaked in"
     )
+
+
+# ── Phase N7: daily/weekly cron-equivalents fire on simulated time ─────────
+
+class _FakeDreamCommittee:
+    """A dream-capable committee stand-in - LiveCommitteeProvider needs a
+    real ANTHROPIC_API_KEY, which this test suite must not depend on."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def dream(self, qualifying, scores, window_days, min_bucket_trades):
+        self.calls += 1
+        return []
+
+
+def test_daily_and_weekly_timers_fire_during_a_multi_day_backtest(tmp_path):
+    """make_bars()'s 150 H1 bars start 2026-01-01 (Thursday) and span ~6
+    days, crossing Sunday 2026-01-04 - long enough for every one of the
+    three Phase N7 cron-equivalents (daily briefing 00:05 UTC, daily review
+    23:55 UTC, weekly dream Sunday 22:30 UTC) to fire at least once on
+    simulated time. Wires a real Journal and a fake dream-capable committee
+    (not LiveCommitteeProvider, which needs a real API key) and asserts on
+    what actually happened - not just that nothing raised."""
+    instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")
+    venue = instrument.id.venue
+
+    engine = BacktestEngine(BacktestEngineConfig(logging=LoggingConfig(bypass_logging=True)))
+    engine.add_venue(
+        venue=venue, oms_type=OmsType.NETTING, account_type=AccountType.MARGIN,
+        base_currency=USD, starting_balances=[Money(50_000, USD)],
+    )
+    engine.add_instrument(instrument)
+
+    bar_type = BarType.from_str(f"{instrument.id}-1-HOUR-LAST-EXTERNAL")
+    frame = make_bars(n=150, drift=0.0005, seed=7)
+    engine.add_data(_make_nautilus_bars(bar_type, instrument, frame))
+    engine.add_data(_make_nautilus_quotes(instrument, frame))
+
+    from wit.ops.journal import Journal
+    journal_path = tmp_path / "journal.jsonl"
+    journal = Journal(str(journal_path))
+    committee = _FakeDreamCommittee()
+    dream_state_path = tmp_path / "dream_state.json"
+    fund_state = FundStateActor(
+        FundStateActorConfig(
+            venue=venue, account_currency="USD",
+            kill_switch_file=str(tmp_path / "KILL"),
+            dream_state_path=str(dream_state_path),
+            poll_interval_seconds=3600,
+        ),
+        journal=journal, committee=committee,
+    )
+    strategy = WitStrategy(
+        WitStrategyConfig(instrument_id=instrument.id, bar_type=bar_type, symbol="EURUSD",
+                          timeframe="H1", history_bars=100),
+        provider=StubPolicyProvider(action="BUY", conviction=0.6),
+        fund_state=fund_state, journal=journal,
+    )
+    engine.add_actor(fund_state)
+    engine.add_strategy(strategy)
+
+    from wit.config import CONFIG
+    production_path = Path(CONFIG.dream.state_path)
+    production_mtime_before = production_path.stat().st_mtime if production_path.exists() else None
+
+    engine.run()
+    engine.dispose()
+
+    # dream.run() calls save() unconditionally, even with zero qualifying
+    # buckets (no positions closed within a 6-day run is expected - a
+    # bracket order's SL/TP may not trigger that fast) - so this is the
+    # reliable signal the weekly timer actually fired, independent of
+    # whether the committee itself got called.
+    assert dream_state_path.exists(), "dream.run() never saved state - the weekly timer didn't fire"
+
+    # Regression guard, same reasoning as kill_switch_file having no
+    # fallback default (Phase N5 audit finding F4): _on_weekly_dream must
+    # save to the actor's OWN configured dream_state_path, never silently
+    # fall through to the real production data/dream_state.json just
+    # because it read CONFIG.dream directly.
+    assert not production_path.exists() or production_path.stat().st_mtime == production_mtime_before, (
+        "the weekly dream timer wrote to the production dream_state.json "
+        "instead of the actor's own configured dream_state_path"
+    )
+
+    kinds = [r.get("kind") for r in journal.read() if r.get("type") == "event"]
+    assert "dream_cycle" in kinds
+    assert "review_error" not in kinds, "daily review raised - see the journal for the traceback"
+    assert "briefing_error" not in kinds, "daily briefing raised - see the journal for the traceback"
+    assert "dream_error" not in kinds, "weekly dream raised - see the journal for the traceback"
+
+
+def test_fractional_kelly_does_not_crash_across_a_multi_trade_backtest(tmp_path, monkeypatch):
+    """Smoke test for the Kelly wiring landed in Phase N7
+    (FundStateActor._recompute_multipliers): enabling it must not crash even
+    though the pure math in wit/risk/adaptive.py is already covered
+    directly. Uses the shared StubPolicyProvider (always BUY) over 150 bars
+    so multiple positions open and close, giving kelly_stats() a non-empty
+    sample."""
+    import wit.nautilus.actor as actor_module
+    from wit.config import AdaptiveConfig, Config
+
+    monkeypatch.setattr(actor_module, "CONFIG",
+                        Config(adaptive=AdaptiveConfig(use_fractional_kelly=True,
+                                                        kelly_min_trades=1)))
+
+    instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")
+    venue = instrument.id.venue
+    engine = BacktestEngine(BacktestEngineConfig(logging=LoggingConfig(bypass_logging=True)))
+    engine.add_venue(
+        venue=venue, oms_type=OmsType.NETTING, account_type=AccountType.MARGIN,
+        base_currency=USD, starting_balances=[Money(50_000, USD)],
+    )
+    engine.add_instrument(instrument)
+    bar_type = BarType.from_str(f"{instrument.id}-1-HOUR-LAST-EXTERNAL")
+    frame = make_bars(n=150, drift=0.0005, seed=7)
+    engine.add_data(_make_nautilus_bars(bar_type, instrument, frame))
+    engine.add_data(_make_nautilus_quotes(instrument, frame))
+
+    from wit.ops.journal import Journal
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    fund_state = FundStateActor(
+        FundStateActorConfig(
+            venue=venue, account_currency="USD",
+            kill_switch_file=str(tmp_path / "KILL"),
+            dream_state_path=str(tmp_path / "dream_state.json"),
+            poll_interval_seconds=3600,
+        ),
+        journal=journal,
+    )
+    strategy = WitStrategy(
+        WitStrategyConfig(instrument_id=instrument.id, bar_type=bar_type, symbol="EURUSD",
+                          timeframe="H1", history_bars=100),
+        provider=StubPolicyProvider(action="BUY", conviction=0.6),
+        fund_state=fund_state, journal=journal,
+    )
+    engine.add_actor(fund_state)
+    engine.add_strategy(strategy)
+
+    engine.run()
+    kelly_mult, _drawdown_mult = fund_state.size_multipliers()
+    engine.dispose()
+
+    assert 0.0 < kelly_mult, "kelly_multiplier() must always return a positive multiplier"

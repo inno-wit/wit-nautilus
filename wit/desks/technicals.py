@@ -13,7 +13,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
 
@@ -53,8 +52,18 @@ def _rsi(close: pd.Series, period: int = 14) -> float:
     delta = close.diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return float((100 - 100 / (1 + rs)).iloc[-1])
+    last_loss = float(loss.iloc[-1])
+    if last_loss == 0:
+        # No losses anywhere in the window (a constant or monotonically
+        # rising tape) - RS is a division by zero, not a real extreme to
+        # report. Clamp to neutral rather than emit a bare NaN: a bare NaN
+        # isn't valid JSON (RFC 8259), and QuantAnalystReport.to_dict() ->
+        # Journal.write() used to write it straight to JSONL, silently
+        # breaking any non-Python reader (jq, JSON.parse). Owed from the
+        # Phase N2 audit's finding F2; wired up in Phase N7.
+        return 50.0
+    rs = float(gain.iloc[-1]) / last_loss
+    return 100 - 100 / (1 + rs)
 
 
 def _atr(bars: pd.DataFrame, period: int = 14) -> float:

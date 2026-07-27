@@ -54,6 +54,7 @@ from wit.committee.provider import DecisionProvider
 from wit.config import CONFIG, IBConfig
 from wit.nautilus.actor import FundStateActor, FundStateActorConfig
 from wit.nautilus.strategy import WitStrategy, WitStrategyConfig
+from wit.ops.alerts import Alerter
 from wit.ops.journal import Journal
 
 # 7497 = TWS paper, 4002 = IB Gateway paper (build plan §3 Phase N6 / Phase N0
@@ -192,6 +193,9 @@ def build_strategies(
             # backtest is unaffected), so IB wiring must override it
             # explicitly or every decision dies at "no_account_snapshot".
             account_venue=IB_VENUE,
+            # Live/paper only (Phase N7) - see WitStrategyConfig's docstring
+            # for why a backtest must never make this call.
+            enable_market_intel=True,
         )
         strategies.append(WitStrategy(config, provider=provider, fund_state=fund_state,
                                       journal=journal))
@@ -228,13 +232,16 @@ def build_node() -> TradingNode:
     ib = CONFIG.ib  # Phase N6 audit finding F10: read once, assert, and use
     assert_paper_only(ib)  # this exact object - not re-read separately by build_config.
 
-    fund_state = FundStateActor(FundStateActorConfig(
-        venue=IB_VENUE,
-        kill_switch_file=CONFIG.safety.kill_switch_file,
-        dream_state_path=CONFIG.dream_state_path,
-    ))
     provider = LiveCommitteeProvider()
     journal = Journal(CONFIG.journal_path)
+    fund_state = FundStateActor(
+        FundStateActorConfig(
+            venue=IB_VENUE,
+            kill_switch_file=CONFIG.safety.kill_switch_file,
+            dream_state_path=CONFIG.dream.state_path,
+        ),
+        journal=journal, committee=provider, alerter=Alerter.from_env(),
+    )
 
     config = build_config(ib)
     node = TradingNode(config=config)

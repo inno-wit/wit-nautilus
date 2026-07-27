@@ -43,7 +43,7 @@ from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 from wit.committee.contract import CommitteeDecision
 from wit.committee.provider import DecisionProvider
 from wit.config import CONFIG
-from wit.desks import garch, markov, quant_analyst, technicals
+from wit.desks import garch, market_intel, markov, quant_analyst, technicals
 from wit.desks.quant_analyst import QuantAnalystReport
 from wit.nautilus.actor import FundStateActor
 from wit.ops import market_hours, prefilter
@@ -71,6 +71,13 @@ class WitStrategyConfig(StrategyConfig, frozen=True):
     account_currency: str = "USD"
     value_per_unit: float = 1.0
     min_stop_distance: float = 0.0
+    # Off by default (Phase N7): market_intel.compute() makes a live yfinance/
+    # Finnhub HTTP call, which a backtest must never depend on for
+    # determinism or for running offline in CI - the MT5 build had the same
+    # split (engine/orchestrator.py's live cycle calls it; engine/backtest.py
+    # never imports it at all). node_live.py's build_strategies() turns this
+    # on explicitly for live/paper.
+    enable_market_intel: bool = False
     # The venue the ACCOUNT is registered under - not necessarily the same as
     # instrument_id.venue. Defaults to None, resolved at lookup time to
     # instrument_id.venue (Phase N5 backtest's single-venue setup, unchanged).
@@ -207,10 +214,10 @@ class WitStrategy(Strategy):
                                     tech, mk, gk)
             return
 
+        intel = market_intel.compute(symbol, CONFIG.intel) if self.config.enable_market_intel else None
         report = quant_analyst.compute(
             symbol, self.config.timeframe, tech, mk, gk,
-            intel=None,  # market_intel desk wiring lands with N7's CLI/ops work
-            dream=self.fund_state.dream_state,
+            intel=intel, dream=self.fund_state.dream_state,
         )
         # Already off-loop (or, in backtest, executing synchronously anyway) -
         # continue straight into the deliberation callback rather than
