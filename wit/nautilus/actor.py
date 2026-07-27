@@ -33,8 +33,15 @@ from wit.risk import adaptive
 
 class FundStateActorConfig(ActorConfig, frozen=True):
     venue: Venue
+    # kill_switch_file has NO default (Phase N5 audit finding F4): the actor
+    # previously fell back to CONFIG.safety.kill_switch_file - the real,
+    # production kill-switch path - whenever a caller omitted it. A backtest
+    # or parameter sweep that trips the daily-loss breaker (routine, at
+    # 0.5%-per-trade risk over any real drawdown) would then write the LIVE
+    # kill switch, halting the actual fund the next time it starts. Every
+    # caller, including tests, must now decide the path explicitly.
+    kill_switch_file: str
     account_currency: str = "USD"
-    kill_switch_file: str = ""
     dream_state_path: str = ""
     poll_interval_seconds: int = 30
 
@@ -42,7 +49,7 @@ class FundStateActorConfig(ActorConfig, frozen=True):
 class FundStateActor(Actor):
     def __init__(self, config: FundStateActorConfig) -> None:
         super().__init__(config)
-        self._kill_switch_path = Path(config.kill_switch_file or CONFIG.safety.kill_switch_file)
+        self._kill_switch_path = Path(config.kill_switch_file)
         self._halted = False
         self._halt_reason: str | None = None
         self._kelly_mult = 1.0
@@ -100,21 +107,47 @@ class FundStateActor(Actor):
         return self._halt_reason
 
     # -- daily-loss breaker + adaptive multipliers ---------------------------
-    def _recompute_multipliers(self) -> None:
-        acfg = CONFIG.adaptive
+    def _read_equity(self) -> float | None:
         try:
             from nautilus_trader.model.objects import Currency
             currency = Currency.from_str(self.config.account_currency)
             equity_by_ccy = self.portfolio.equity(self.config.venue)
-            equity = float(equity_by_ccy[currency]) if equity_by_ccy and currency in equity_by_ccy else None
+            return float(equity_by_ccy[currency]) if equity_by_ccy and currency in equity_by_ccy else None
         except Exception as e:  # noqa: BLE001 - sizing inputs must never crash the actor
             self.log.warning(f"could not read portfolio equity: {type(e).__name__}: {e}")
-            equity = None
+            return None
 
-        now = datetime.now(UTC)
+    def _realized_pnl_since(self, since_ns: int) -> float:
+        """Sum of closed-position realized P&L (incl. commissions) since
+        ``since_ns`` - Portfolio.equity() is NOT used for this (Phase N5 audit
+        finding F1): for a margin account it's documented as
+        ``balance.total + sum(unrealized_pnl(open positions))``, so an equity
+        delta conflates open-position mark-to-market with realized P&L. MT5's
+        SafetyMonitor breaker reads strictly realized closed P&L
+        (``broker.closed_pnl_since``); this is that same measurement over
+        Nautilus's own closed-position cache."""
+        total = 0.0
+        for pos in self.cache.positions_closed(venue=self.config.venue):
+            if pos.ts_closed is not None and pos.ts_closed >= since_ns and pos.realized_pnl is not None:
+                total += float(pos.realized_pnl)
+        return total
+
+    def _recompute_multipliers(self) -> None:
+        acfg = CONFIG.adaptive
+        # self.clock.utc_now(), not datetime.now(UTC) (Phase N5 audit finding
+        # F1/F3): in a backtest this clock is simulated time, potentially
+        # months away from wall-clock "now" - using the real system clock here
+        # meant _start_of_day_equity never rolled over across a multi-day
+        # backtest, silently turning "daily loss" into "cumulative loss since
+        # the run started". self.clock is correct in both backtest and live.
+        now = self.clock.utc_now()
         if self._day != now.date():
             self.reset_daily_state()
             self._day = now.date()
+        day_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
+        day_start_ns = int(day_start.timestamp() * 1_000_000_000)
+
+        equity = self._read_equity()
         if self._start_of_day_equity is None:
             self._start_of_day_equity = equity
 
@@ -122,7 +155,7 @@ class FundStateActor(Actor):
             self._kelly_mult, self._drawdown_mult = 1.0, 1.0
             return
 
-        realized = equity - self._start_of_day_equity
+        realized = self._realized_pnl_since(day_start_ns)
         if acfg.drawdown_throttle:
             self._drawdown_mult = adaptive.drawdown_multiplier(
                 realized, self._start_of_day_equity, CONFIG.risk.max_daily_loss,

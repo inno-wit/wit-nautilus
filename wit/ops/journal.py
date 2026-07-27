@@ -30,7 +30,16 @@ from wit.config import CONFIG
 
 
 def _default(o: Any) -> Any:
-    """Make numpy scalars and datetimes JSON-safe."""
+    """Make numpy scalars/arrays and datetimes JSON-safe.
+
+    Checks ``tolist`` before ``item`` (Phase N5 audit finding F12): a
+    multi-element numpy array has both attributes, but ``.item()`` raises
+    ``ValueError`` on anything but a size-1 array — and since that's not the
+    ``TypeError`` ``json.dumps`` expects from a serializer hook, it used to
+    escape ``write()`` uncaught. ``.tolist()`` handles arrays of any shape.
+    """
+    if hasattr(o, "tolist"):
+        return o.tolist()
     if hasattr(o, "item"):
         return o.item()
     if isinstance(o, datetime):

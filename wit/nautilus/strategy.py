@@ -30,7 +30,7 @@ because MT5 exits are broker-side and invisible to its journal — see
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 import pandas as pd
 from nautilus_trader.core.datetime import unix_nanos_to_dt
@@ -148,10 +148,23 @@ class WitStrategy(Strategy):
         self.unsubscribe_bars(self.config.bar_type)
         self.unsubscribe_quote_ticks(self.config.instrument_id)
 
-    # -- fast path: must return in microseconds -----------------------------
+    # -- fast path: hands off immediately, does no work on the loop ---------
     def on_bar(self, bar: Bar) -> None:
+        """Schedules everything else off-loop. Originally this method also ran
+        the desk computation (technicals/markov/garch) inline before handing
+        off to `_on_decision` for the committee call — the docstring's
+        "must return in microseconds" claim was false while it did that:
+        `garch.compute` alone measured ~1s cold (a real scipy optimization)
+        directly on the event loop (Phase N5 audit finding F7). Since
+        `run_in_executor` degrades to a synchronous inline call in backtest
+        (same total work, same order — this is not a behavior change there)
+        and dispatches to a worker thread in live, moving the whole body
+        behind that boundary fixes the live-mode violation for free."""
         if self.instrument is None or self.spec is None:
             return
+        self.run_in_executor(self._on_bar_work, args=(bar,))
+
+    def _on_bar_work(self, bar: Bar) -> None:
         symbol = self.config.symbol
 
         bars = self.cache.bars(self.config.bar_type)
@@ -189,11 +202,10 @@ class WitStrategy(Strategy):
             intel=None,  # market_intel desk wiring lands with N7's CLI/ops work
             dream=self.fund_state.dream_state,
         )
-        bar_ts_ns = bar.ts_event
-        self.run_in_executor(
-            self._on_decision,
-            args=(report, bar_ts_ns),
-        )
+        # Already off-loop (or, in backtest, executing synchronously anyway) -
+        # continue straight into the deliberation callback rather than
+        # scheduling a second executor hop.
+        self._on_decision(report, bar.ts_event)
 
     def _journal_synthetic(
         self, symbol: str, bar: Bar, decision: CommitteeDecision,
@@ -257,10 +269,30 @@ class WitStrategy(Strategy):
                                          self.spec, spread)
                 if reject:
                     self.journal.log_event("revalidation_block", reject, symbol=symbol)
+                # Re-check right before submitting, not just at the top of this
+                # method (Phase N5 audit finding F2): provider.decide() can run
+                # up to ~90s per call, and this whole method runs off-loop via
+                # run_in_executor - an operator's `on_stop`/kill-switch signal
+                # during that window must not be followed by a submit anyway.
+                # Without this, on_stop's cancel_all_orders can run BEFORE this
+                # order even exists, leaving an unmanaged live position the
+                # strategy believes it is flat on.
+                elif not self.is_running:
+                    self.journal.log_event("stopped_before_submit",
+                                           "strategy stopped while deliberating", symbol=symbol)
+                elif self.fund_state.is_halted():
+                    self.journal.log_event("halted_before_submit",
+                                           self.fund_state.halt_reason or "halted", symbol=symbol)
                 else:
                     order_result = self._submit(plan)
 
-        self.journal.log_decision(symbol, decision, plan, report, order_result)
+        # Phase N5 audit finding F8: client_order_id was computed in
+        # _submit's return value but never threaded into log_decision's own
+        # client_order_id field (only into the nested `order` dict) - every
+        # decision record's top-level identifier stayed blank.
+        client_order_id = (order_result or {}).get("client_order_id", "")
+        self.journal.log_decision(symbol, decision, plan, report, order_result,
+                                  client_order_id=client_order_id)
 
     def _in_cooldown(self) -> bool:
         minutes = CONFIG.risk.cooldown_minutes
@@ -271,7 +303,13 @@ class WitStrategy(Strategy):
             return False
         last_close_ns = max(p.ts_closed for p in closed if p.ts_closed is not None)
         last_close = unix_nanos_to_dt(last_close_ns)
-        elapsed = (datetime.now(UTC) - last_close).total_seconds() / 60.0
+        # self.clock.utc_now(), not datetime.now(UTC) (Phase N5 audit finding
+        # F3): ts_closed is simulated time in a backtest, potentially months
+        # away from wall-clock "now" - comparing against the real system clock
+        # made this gate permanently inert in backtest (elapsed always huge),
+        # silently overstating backtest performance by permitting re-entries
+        # live trading would refuse.
+        elapsed = (self.clock.utc_now() - last_close).total_seconds() / 60.0
         return elapsed < minutes
 
     def _account_snapshot(self) -> AccountSnapshot | None:

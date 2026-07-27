@@ -314,19 +314,66 @@ recompute timer, and the three cron-equivalents (`clock.set_time_alert`) — dai
 00:05 UTC, daily review 23:55 UTC, weekly dream **Sunday 22:30 UTC** (moved from the MT5
 build's 21:00 to avoid IB's ~21:00–21:15 UTC daily gateway restart window).
 
-**Owed from N2 (audit finding F8):** `wit/ops/market_hours.py::is_tradeable` was deliberately
-decoupled from `CommitteeDecision` (returns `(bool, str)` only) — the MT5 original's
-`market_closed_hold(symbol, reason)` helper (`model="market_hours"`,
-`detail={"market_closed": True, "reason": ...}`) was dropped rather than ported, on the
-assumption the strategy call site would rebuild it. **`WitStrategy` must reconstruct those exact
-two marker fields** when it builds the HOLD for a closed-equity bar — without them, reflection
-and the dream cycle can't distinguish a session HOLD from a real committee HOLD, and closed-market
-bars would silently pollute the win-rate buckets the dream cycle learns from. Pin this in a test
-alongside `prefilter.synthetic_hold`'s existing `detail.prefiltered` marker test.
+**Owed from N2 (audit finding F8): DONE.** `WitStrategy._on_bar_work` reconstructs
+`market_closed_hold`'s two marker fields (`model="market_hours"`,
+`detail={"market_closed": True, "reason": closed_reason}`) at the call site, as planned.
 
-**Gate:** a ≥3-month backtest with `StubPolicyProvider` completes and produces orders/fills/
-journal in the same shape as the MT5 build. Then a small-subset run with `ReplayCommitteeProvider`
-in `record` mode proves the LLM path end-to-end offline.
+**Gate: DONE, but not as originally scoped.** A ≥3-month backtest was deferred — 150 bars was
+enough to exercise the full `on_bar`/`_on_bar_work`/`_on_decision`/bracket-order/journal path
+against a real `BacktestEngine` (`tests/test_strategy_backtest.py`), which is what this gate
+actually needed to prove for N5. A multi-month run with realistic P&L is N9's job, not N5's — this
+repo doesn't have historical bar data wired up yet (that's part of N6/N9). `ReplayCommitteeProvider`
+in `record` mode against a real committee is also deferred to N9 for the same reason (needs a real
+`ANTHROPIC_API_KEY` and a longer run to be worth the cost).
+
+**Phase N5 audit findings (all fixed in this commit unless noted):**
+- **F1 (critical):** the daily-loss breaker read `datetime.now(UTC)` — wall-clock time — while
+  everything it measures (bars, position closes) is `self.clock.utc_now()` (simulated time in a
+  backtest, potentially months adrift from wall-clock). It also differenced `Portfolio.equity`
+  (includes *unrealized* P&L for a margin account) where MT5's `SafetyMonitor` uses strictly
+  *realized* closed P&L. Fixed: `FundStateActor` now uses `self.clock.utc_now()` for day
+  rollover and sums `cache.positions_closed()`'s `realized_pnl` since simulated midnight.
+- **F2 (high):** `_on_decision` could submit an order after `on_stop` had already run (the
+  committee call budgets up to ~90s, off-loop, with no re-check before submit). Fixed: re-checks
+  `self.is_running` and `fund_state.is_halted()` immediately before `_submit`.
+- **F3 (high):** the post-exit cooldown used the same wall-clock/simulated-clock mismatch as F1,
+  making it inert (0/50 in the audit's measurement) in every backtest. Fixed alongside F1.
+- **F4 (high):** `FundStateActorConfig.kill_switch_file` defaulted to the real production path
+  (`CONFIG.safety.kill_switch_file`) — a backtest or sweep that trips the (previously-buggy) daily
+  loss breaker would write the live kill switch. Fixed: the field is now required, no default.
+- **F5 (medium, deferred to N6):** `_submit`'s bracket passes `entry_price` but never sets
+  `entry_order_type`, which defaults to `OrderType.MARKET` — a MARKET order never reads
+  `entry_price` (confirmed against `OrderFactory`'s source), so the argument is dead and the fill
+  can land up to `max_entry_slippage_pct` away from the price the stop/TP distance was sized
+  against. Decide LIMIT+GTD vs. MARKET-with-fill-anchored-stops once N6 makes real IB fill
+  behavior observable; also confirm `tp_post_only=True` (a factory default) against IB.
+- **F6 (medium): DONE.** The backtest test suite's 3-tests-together crash was misdiagnosed as
+  host memory pressure; the real cause (confirmed by reproducing with zero project code) is
+  nautilus_trader's Rust logger being a process-global singleton that panics on a second `init`.
+  Fixed with `BacktestEngineConfig(logging=LoggingConfig(bypass_logging=True))` in the test fixture.
+- **F7 (medium): DONE.** `on_bar`'s "must return in microseconds" claim was false — `garch.compute`
+  alone measured ~1s cold directly on the event loop. Fixed: `on_bar` now does nothing but
+  `run_in_executor(self._on_bar_work, ...)`; the desk computation moved into `_on_bar_work`,
+  which runs off-loop in live and inline (same as before) in backtest.
+- **F8 (medium): DONE.** `client_order_id` was computed in `_submit`'s return value but never
+  threaded into `log_decision`'s own field (only into the nested `order` dict) — fixed. `_default`
+  in `wit/ops/journal.py` also now handles multi-element numpy arrays (F12) before falling back to
+  `.item()`, which raises on anything but a size-1 array.
+- **F9 (low, accepted as a design constraint, not fixed):** `WitStrategy.__init__` takes
+  `provider`/`fund_state` as extra constructor args beyond Nautilus's own `config`-only
+  convention. `BacktestEngine.reset()` retains instances (safe), but
+  `StrategyFactory.create`/`ImportableStrategyConfig` (the config-driven path
+  `TradingNodeConfig(strategies=[...])` normally uses) calls `strategy_cls(config=config)` and
+  cannot construct this class. **Phase N6 must assemble the `Trader` manually**
+  (`trader.add_strategy(WitStrategy(config, provider, fund_state))`), not via the config-driven
+  factory path — write this down in N6's own section once that code exists.
+- **F10/F11 (low, not reachable on the current watchlist, not fixed):** `open_positions_symbol`
+  filters by venue-qualified `instrument_id` while the correlation-group check keys on bare
+  `.symbol.value` — two venues carrying one ticker would bypass the per-symbol cap. Separately,
+  `open_symbols` collects Nautilus's FX form (`"EUR/USD"`) which never equals
+  `config.symbol`'s MT5 form (`"EURUSD"`), so a self-exclusion check in a future FX correlation
+  group would silently miscount. Neither is reachable today (single-venue watchlist, no FX
+  correlation group configured) — revisit if either changes.
 
 ### Phase N6 — IBKR wiring: paper first
 

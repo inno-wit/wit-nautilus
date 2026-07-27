@@ -12,17 +12,20 @@ Phase N3's job) or produce a meaningful P&L (Phase N9's).
 
 Each test constructs and runs a full BacktestEngine kernel (MessageBus,
 Cache, DataEngine, RiskEngine, ExecEngine) - genuinely heavier than the rest
-of this suite. Verified individually and passing on this dev machine; running
-all three back-to-back in one pytest process was unreliable specifically when
-the machine was already under severe memory pressure (~90% RAM/swap used from
-unrelated processes) - not reproduced when memory was available, and not
-something a code change here can fix. If this file ever hangs or exits
-oddly in CI, check host memory before suspecting the strategy.
+of this suite. Running more than one bare BacktestEngine in a single process
+previously crashed the interpreter (Windows STATUS_STACK_BUFFER_OVERRUN) after
+the first `dispose()`. Phase N5's audit traced the real cause: nautilus_trader's
+Rust logger is a process-global singleton, and the second engine's init panics
+trying to install it again - reproduced with zero project code (three bare
+`BacktestEngine()`s), nothing to do with host memory (an earlier note here
+wrongly blamed memory pressure). `bypass_logging=True` below sidesteps the
+second init entirely and all three tests pass together reliably.
 """
 from __future__ import annotations
 
 import pytest
-from nautilus_trader.backtest.engine import BacktestEngine
+from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
+from nautilus_trader.common.config import LoggingConfig
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.data import Bar, BarType, QuoteTick
 from nautilus_trader.model.enums import AccountType, OmsType
@@ -90,7 +93,9 @@ def engine_setup(tmp_path):
     instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")
     venue = instrument.id.venue
 
-    engine = BacktestEngine()
+    engine = BacktestEngine(
+        BacktestEngineConfig(logging=LoggingConfig(bypass_logging=True))
+    )
     engine.add_venue(
         venue=venue,
         oms_type=OmsType.NETTING,
@@ -152,22 +157,54 @@ def test_backtest_produces_journalled_decisions(engine_setup):
               if line.strip()]
     decisions = [r for r in records if r.get("type") == "decision"]
     assert len(decisions) > 0, "expected at least one journalled decision over 150 bars"
-    # Every decision should be traceable to the stub's fixed BUY verdict once
-    # the desks have enough warmup bars and no gate (market hours/prefilter)
-    # intervened - confirms the on_bar -> run_in_executor -> _on_decision ->
-    # build_plan -> journal path actually ran, not just that on_bar fired.
-    assert any(r["action"] in ("BUY", "HOLD") for r in decisions)
+    # Phase N5 audit finding F13: the original assertion here
+    # (any(action in ("BUY", "HOLD"))) is tautological - build_plan forces
+    # action to "HOLD" on any block and the stub only ever proposes "BUY", so
+    # no reachable state could fail it. Require what the stub actually
+    # requests to reach the strategy at all - if every gate silently blocked
+    # every bar, this fails where the old assertion couldn't.
+    assert any(r["action"] == "BUY" for r in decisions), (
+        "expected at least one BUY-proposed decision - "
+        f"got actions: {sorted({r['action'] for r in decisions})}"
+    )
 
 
 def test_backtest_places_at_least_one_order(engine_setup):
     engine, _journal_path, _frame = engine_setup
     engine.run()
 
-    orders = engine.trader.generate_order_fills_report()
-    positions = engine.cache.positions()
+    # Phase N5 audit finding F13: check the order cache directly rather than
+    # an `or` across two proxies (positions / a fills report) that couldn't
+    # distinguish "an order was placed" from "a position exists" - EURUSD is
+    # FX (no market-hours gate) and the stub always says BUY with conviction
+    # 0.6, so over 150 H1 bars the sizing/spread/conviction gates should clear
+    # at least once, proving order_factory.bracket -> submit_order_list
+    # actually executed.
+    orders = engine.cache.orders()
     engine.dispose()
-    # EURUSD is FX (no market-hours gate) and the stub always says BUY with
-    # conviction 0.6 - over 150 H1 bars the sizing/spread/conviction gates
-    # should clear at least once, proving the bracket-order submission path
-    # (order_factory.bracket -> submit_order_list) actually executed.
-    assert len(positions) > 0 or not orders.empty
+    assert len(orders) > 0, "expected at least one order submitted over 150 bars"
+
+
+def test_fund_state_day_rollover_tracks_simulated_time_not_wall_clock(engine_setup):
+    """Phase N5 audit finding F1: FundStateActor._recompute_multipliers used
+    to read datetime.now(UTC) - wall-clock time - for day rollover, while
+    every bar/position timestamp it's compared against is simulated time.
+    make_bars()'s 150 H1 bars start 2026-01-01 (see tests/conftest.py) and
+    span ~6 days; if the actor's day-tracking is on wall-clock time instead of
+    self.clock.utc_now(), it either never rolls over (frozen at whatever wall
+    date the test happened to run on) or - worse - "rolls over" using a wall
+    date nowhere near the bars being processed. Either way it won't land in
+    January 2026, which is what a correct simulated-clock read must produce."""
+    engine, _journal_path, _frame = engine_setup
+    fund_state = engine.trader.actors()[0]
+    assert fund_state.__class__.__name__ == "FundStateActor"
+
+    engine.run()
+    final_day = fund_state._day
+    engine.dispose()
+
+    assert final_day is not None
+    assert final_day.year == 2026 and final_day.month == 1, (
+        f"expected the actor's tracked day to land in Jan 2026 (simulated time "
+        f"the bars actually occupy), got {final_day} - looks like wall-clock time leaked in"
+    )
