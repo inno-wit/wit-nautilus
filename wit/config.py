@@ -85,17 +85,22 @@ class IntelConfig:
 
 @dataclass(frozen=True)
 class RiskConfig:
-    """Ported verbatim from the MT5 build's ``RiskConfig`` — gate ordering, caps and
+    """Ported from the MT5 build's ``RiskConfig`` — gate ordering, caps and
     thresholds are the risk guarantees the port must not silently change (see §1.4 of
     the build plan). ``paper_only`` here mirrors ``SafetyConfig.paper_only``; the boot
-    assertion in Phase N6 is the actual enforcement point, not this flag."""
+    assertion in Phase N6 is the actual enforcement point, not this flag.
+
+    ``max_spread_points`` is dropped as of Phase N4: it was an MT5-specific "points"
+    concept (a broker/instrument-specific tick count) with no coherent IBKR
+    equivalent. ``max_spread_pct`` — already flagged in the MT5 build's own comment
+    as the more correct cross-instrument measure — is now the sole spread gate. See
+    ``wit/risk/instrument_spec.py``'s module docstring for the full reasoning."""
 
     risk_per_trade: float = 0.005        # 0.5% of equity risked per trade
     max_concurrent_positions: int = 3
     max_daily_loss: float = 0.03         # 3% equity daily loss -> auto-halt
     per_symbol_max_positions: int = 1
-    max_spread_points: int = 50          # skip if spread wider than this
-    max_spread_pct: float = 0.0015       # and/or wider than 0.15% of price
+    max_spread_pct: float = 0.0015       # skip if spread wider than 0.15% of price
     target_annual_vol: float = 0.15      # GARCH vol-target anchor
     size_multiplier_floor: float = 0.25  # GARCH clamp
     size_multiplier_cap: float = 2.0
