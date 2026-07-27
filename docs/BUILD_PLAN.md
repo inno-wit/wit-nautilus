@@ -398,17 +398,71 @@ sees one fund-wide equity figure across both asset classes, not a partial per-ex
 `INSTRUMENT_IDS` maps the N0-confirmed 8-symbol watchlist to Nautilus/IB instrument-id strings
 directly (no dynamic resolution yet — matches the plan's "no options, futures, or crypto" scope).
 
-**Gate: NOT YET RUN.** Node connects, instruments resolve, warmup+live bars arrive, one bracket
-order fills on paper and appears in the journal with a Nautilus position id. This requires a
-real, watched connection to the user's TWS/Gateway paper session — confirmed reachable
-(port 7497) during this phase, but deliberately not attempted unattended: it's the first point
-in the whole build where code would actually talk to a live (even if paper) brokerage connection
-and could place a real order, which crosses from "write and test code" into "operate a connected
-trading system" — exactly the kind of action that warrants an explicit go-ahead rather than
-proceeding autonomously. `.env` also isn't fully populated yet (`TWS_ACCOUNT` is blank in the
-current `.env`, confirmed while building this phase). Everything up to that boundary
-(`assert_paper_only`, `build_config`, `build_strategies`) has real test coverage
-(`tests/test_node_live.py`) and needs no live connection to verify.
+**Gate: NOT YET RUN** — a live, watched connection to TWS/Gateway paper is still Phase N7+ work,
+deliberately not attempted unattended in N6 (see below). It's the first point in the whole build
+where code would actually talk to a live brokerage connection and could place a real order, which
+crosses from "write and test code" into "operate a connected trading system."
+
+**Phase N6 audit — the safety lock holds, the trading path underneath it didn't (all fixed in a
+follow-up commit).** `assert_paper_only()` itself passed adversarial review with no bypass found.
+But the first read-only, order-free verification against the live TWS paper session (contract
+details only — the exact kind of check the "don't operate the system" caution should *not* have
+covered, and the audit called this out directly) found the hard-coded instrument mapping was
+wrong for 7 of 8 symbols, and three more defects meant no order could ever have reached IB even
+with correct instruments:
+- **NASDAQ, not SMART, is the primary-exchange venue IB needs.** The venue component of an IB
+  equity `InstrumentId` is that instrument's *primary exchange*; order routing to IB is always
+  SMART regardless and is not something `InstrumentId` encodes. `"NVDA.SMART"` asked IB for a
+  contract whose *primary exchange* is `"SMART"`, which doesn't exist — confirmed live (error 200
+  on all seven equities); re-probed as `.NASDAQ`, all seven resolved to exactly one contract each.
+- **The bar-type string duplicated its step token** (`f"{ib_id}-1-{_bar_step(...)}-..."` where
+  `_bar_step` already returns `"1-HOUR"`), producing a bar type whose instrument id parsed as
+  `"NVDA.NASDAQ-1"` — a phantom instrument `request_bars` silently can't find, so the warmup
+  callback never fires and the strategy never subscribes to anything. `build_strategies` now
+  asserts `bar_type.instrument_id == instrument_id` to make this class of bug loud again.
+- **The account lookup used the wrong venue.** `WitStrategy._account_snapshot()` looked the
+  account up under `instrument_id.venue` (`NASDAQ`/`IDEALPRO`) — for a single-venue backtest that
+  happens to work, but IB registers the account under its own fixed pseudo-venue (`IB_VENUE`),
+  never under an instrument's exchange-routing venue. Every decision died at
+  `"no_account_snapshot"` before `build_plan` was ever reached. Fixed by adding
+  `WitStrategyConfig.account_venue` (defaults to the instrument venue, so N5's backtest is
+  unaffected; IB wiring passes `IB_VENUE` explicitly).
+- **The daily-loss breaker's realized-P&L query was structurally guaranteed to return empty** —
+  `FundStateActor` filtered `cache.positions_closed(venue=self.config.venue)` by the *account*
+  venue, but `Cache` indexes positions by *instrument* venue. The named §1.4 guarantee ("behaviour
+  preserved exactly") was silently disabled, not preserved. Fixed by dropping the venue filter
+  (safe under this system's single-executor-per-account rule).
+- **EURUSD requested `TRADES` bars** (the adapter maps `PriceType.LAST → "TRADES"`), which IB
+  doesn't provide for CASH/FX contracts — needs `MID`. `INSTRUMENT_IDS` now carries
+  `(instrument_id, price_type)` per symbol so adding a new symbol forces the asset-class decision.
+
+Also fixed: `market_data_type` is now set explicitly (was left at the adapter default, silently
+ignoring N0's confirmed equity-entitlement gap); `build_config()` asserts `paper_only` itself
+rather than trusting only its caller; `build_node()` constructs every fallible non-IB object
+(the committee provider, which fails loudly on missing LLM config) *before* `node.build()` and
+disposes the node on any failure, rather than leaking an undisposed kernel if construction failed
+partway through after IB clients were already built.
+
+**Before anyone calls `node.run()` against live TWS** (a checklist, separate from and additional
+to the fixes above): (1) enable US equity market data on the paper account in IBKR Account
+Management — N0's confirmed error-10089 gap, nothing downstream works without it; (2) after the
+exec client connects, add a post-connect re-assertion that every account IB's `managedAccounts`
+actually reports starts with `DU` — this converts the paper guarantee from "the operator
+configured it correctly" to "the broker confirmed it," closing the one residual gap the audit
+found (a live TWS session could technically be configured to listen on a paper port); (3)
+populate `.env` deliberately (`IBG_PORT=7497`, `TWS_ACCOUNT=<the real DU-prefixed id>`); (4) dry
+run `build_node()` alone first (opens no socket — `TradingNode.build()`'s body is just client
+construction, the actual connection happens in `run()`) and confirm it returns without raising;
+(5) then run attended, one symbol first, with the kill switch pre-armed, confirming in order:
+client connects → instruments resolve → warmup bars land in cache → live bars reach `on_bar` →
+`_account_snapshot()` returns a real equity figure → only then let a decision reach `_submit`;
+(6) verify the (now-fixed) daily-loss breaker for real by closing a losing paper position and
+confirming the kill-switch file is written and latches across a restart.
+
+Everything up to a live connection (`assert_paper_only`, `build_config`, `build_strategies`, the
+instrument/bar-type/venue correctness above) has real test coverage (`tests/test_node_live.py`)
+and needs no live connection to verify — the mapping fixes themselves were confirmed via a
+read-only `reqContractDetails` probe against the live TWS paper session, not guessed.
 
 ### Phase N7 — CLI, journal, reflection, dream, alerts
 

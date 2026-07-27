@@ -125,9 +125,20 @@ class FundStateActor(Actor):
         delta conflates open-position mark-to-market with realized P&L. MT5's
         SafetyMonitor breaker reads strictly realized closed P&L
         (``broker.closed_pnl_since``); this is that same measurement over
-        Nautilus's own closed-position cache."""
+        Nautilus's own closed-position cache.
+
+        No ``venue=`` filter here (Phase N6 audit finding F3): ``Cache``
+        indexes positions by *instrument* venue (``NVDA.NASDAQ``,
+        ``EUR/USD.IDEALPRO``, ...), never by the account's own pseudo-venue
+        (``self.config.venue`` — IB's ``IB_VENUE``). Filtering by the account
+        venue here made this query return empty unconditionally, so the
+        breaker computed 0.0 realized P&L forever and could never latch.
+        Unfiltered is correct for the single-executor rule this system
+        already runs under: one `FundStateActor` per broker connection, so
+        every closed position in the cache belongs to this account regardless
+        of which instrument venue it traded on."""
         total = 0.0
-        for pos in self.cache.positions_closed(venue=self.config.venue):
+        for pos in self.cache.positions_closed():
             if pos.ts_closed is not None and pos.ts_closed >= since_ns and pos.realized_pnl is not None:
                 total += float(pos.realized_pnl)
         return total

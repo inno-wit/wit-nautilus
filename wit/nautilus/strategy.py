@@ -36,7 +36,7 @@ import pandas as pd
 from nautilus_trader.core.datetime import unix_nanos_to_dt
 from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.enums import OrderSide
-from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import InstrumentId, Venue
 from nautilus_trader.model.objects import Currency
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
@@ -71,6 +71,16 @@ class WitStrategyConfig(StrategyConfig, frozen=True):
     account_currency: str = "USD"
     value_per_unit: float = 1.0
     min_stop_distance: float = 0.0
+    # The venue the ACCOUNT is registered under - not necessarily the same as
+    # instrument_id.venue. Defaults to None, resolved at lookup time to
+    # instrument_id.venue (Phase N5 backtest's single-venue setup, unchanged).
+    # A multi-venue broker like IB registers the account under its own fixed
+    # pseudo-venue (see wit/nautilus/node_live.py's IB_VENUE), separate from
+    # any instrument's SMART/NASDAQ/IDEALPRO routing venue - passing that
+    # through here is what Phase N6 audit finding F4 requires: without it,
+    # every decision dies at "no_account_snapshot" because the account is
+    # never found under an exchange-routing venue.
+    account_venue: Venue | None = None
 
 
 def _bars_to_frame(bars: list[Bar]) -> pd.DataFrame:
@@ -313,7 +323,12 @@ class WitStrategy(Strategy):
         return elapsed < minutes
 
     def _account_snapshot(self) -> AccountSnapshot | None:
-        venue = self.config.instrument_id.venue
+        # account_venue, not instrument_id.venue (Phase N6 audit finding F4):
+        # a multi-venue broker (IB) registers the account under its own fixed
+        # venue, never under an instrument's exchange-routing venue - using
+        # the latter meant this always returned None against IB, and every
+        # decision died here before build_plan was ever reached.
+        venue = self.config.account_venue or self.config.instrument_id.venue
         equity_by_ccy = self.portfolio.equity(venue)
         account = self.portfolio.account(venue)
         if not equity_by_ccy or account is None:
