@@ -8,9 +8,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Pinned precisely once Phase N0 confirms the nautilus_trader version + IB extra syntax.
+# nautilus_trader==1.230.0 confirmed installable + IB adapter importable on this machine
+# (Python 3.13, Windows) during Phase N0's static-inspection pass. Pinned to that exact
+# version until a deliberate upgrade, since adapter config field names are load-bearing.
 ib = [
-    "nautilus_trader",
+    "nautilus_trader[ib]==1.230.0",
     "anthropic>=0.40",
     "pandas>=2.0",
     "numpy>=1.26",

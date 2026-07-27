@@ -364,22 +364,64 @@ must not change at all** — if it does, the adapter boundary leaked.
 
 ## 4. Open questions — unconfirmed from docs, not guessed
 
-1. **`OrderFactory.bracket()`'s exact Python kwargs** — confirm against the pinned version's
-   `nautilus_trader.common.factories.OrderFactory` before N5.
-2. **How a `Strategy`/`Actor` reaches `RiskEngine.set_trading_state()`** — message-bus command,
-   `self.trader`, or a kernel handle. Kill-switch enforcement's primary path (our own pre-submit
-   gate) needs no framework API either way, so this doesn't block N5, just refines it.
-3. **`Trader.add_actor()`** registration on a `TradingNode`/`BacktestEngine` — low risk, confirm
-   in N5.
-4. **Exact account balance/free-margin accessor names** (`portfolio.account`/`.equity` are
-   confirmed; `balance_total()`/`margin_available()`-style accessors are not). Blocks the
-   `AccountInfo` shim in N4.
-5. **Whether `request_bars` lands in `on_historical_data` or `on_bar`**, and whether a
-   completion signal gates warmup. Blocks N5.
-6. **The sanctioned way to launch/await background work from a `Strategy`** (bare
-   `asyncio.create_task`, or a framework helper). **The single most important unknown in this
-   plan** — the whole off-loop committee design depends on it. Answer in N0 alongside the timer
-   test.
+**Update (N0, static inspection against `nautilus_trader==1.230.0`, pinned via
+`pip install nautilus_trader` — no live gateway needed for these):**
+
+1. **RESOLVED.** `OrderFactory.bracket()`'s full signature (`nautilus_trader.common.factories`):
+   ```
+   bracket(self, instrument_id, order_side, quantity, quote_quantity=False,
+     emulation_trigger=NO_TRIGGER, trigger_instrument_id=None, contingency_type=OUO,
+     entry_order_type=MARKET, entry_price=None, entry_trigger_price=None, expire_time=None,
+     time_in_force=GTC, entry_post_only=False, entry_exec_algorithm_id=None,
+     entry_exec_algorithm_params=None, entry_tags=None, entry_client_order_id=None,
+     tp_order_type=LIMIT, tp_price=None, tp_trigger_price=None, tp_trigger_type=DEFAULT,
+     tp_activation_price=None, tp_trailing_offset=None, tp_trailing_offset_type=PRICE,
+     tp_limit_offset=None, tp_time_in_force=GTC, tp_post_only=True, tp_exec_algorithm_id=None,
+     tp_exec_algorithm_params=None, tp_tags=None, tp_client_order_id=None,
+     sl_order_type=STOP_MARKET, sl_trigger_price=None, sl_trigger_type=DEFAULT,
+     sl_activation_price=None, sl_trailing_offset=None, sl_trailing_offset_type=PRICE,
+     sl_time_in_force=GTC, sl_exec_algorithm_id=None, sl_exec_algorithm_params=None,
+     sl_tags=None, sl_client_order_id=None)
+   ```
+   Default `contingency_type=OUO` (one-updates-other) matches the plan's intent — entry fills,
+   SL/TP become live; one fills, the other cancels. N5's `_on_decision` call is:
+   `self.order_factory.bracket(instrument_id=.., order_side=.., quantity=.., sl_trigger_price=.., tp_price=..)`.
+2. **Still open.** `Strategy`/`Actor` expose no `risk`-named or `trading_state`-named method
+   directly (confirmed by attribute scan — empty result). `RiskEngine.set_trading_state` exists
+   on the engine itself; the path from strategy code to it (message-bus command vs. a kernel
+   handle) is still unconfirmed. Unchanged conclusion: doesn't block N5, since the kill switch's
+   primary enforcement is our own pre-submit gate, which needs no framework API.
+3. **RESOLVED.** `Trader.add_actor(self, actor: Actor) -> None` — single positional arg, exactly
+   as assumed.
+4. **RESOLVED.** Full accessor set confirmed. `Portfolio` (`nautilus_trader.portfolio.portfolio`):
+   `account(venue)`, `equity(venue)`, `unrealized_pnl`, `realized_pnl`, `total_pnl`,
+   `margins_init`, `margins_maint`, `balances_locked`. The `Account` object itself
+   (`nautilus_trader.accounting.accounts.base.Account`) has the free-margin accessors that
+   weren't confirmed before: **`balance_total`, `balance_free`, `balance_locked`**, plus
+   `balances_total`/`balances_free`/`balances_locked` (multi-currency), `id` (an `AccountId` —
+   need to confirm its string form carries the `DU…` prefix for the paper_only assertion, N6),
+   `is_margin_account`. The `AccountInfo` shim in N4 maps directly to these.
+5. **RESOLVED.** `request_bars` docstring, confirmed verbatim: "Once the response is received,
+   the bar data is forwarded from the message bus to the `on_historical_data` handler." Exactly
+   as the plan assumed — no completion-signal gate exists natively, so N5's `ready` flag
+   (flipped once `warmup_bars` accumulate in `on_historical_data`) is still the right design.
+6. **RESOLVED — the most important one.** Both `Actor` and `Strategy` expose
+   `run_in_executor(func, args=None, kwargs=None) -> TaskId` and
+   `queue_for_executor(func, args=None, kwargs=None)` (sequential variant), backed by
+   `register_executor(loop, executor)`. Docstring, verbatim: **"For backtesting the `func` is
+   immediately executed, as there's no need for a `Future` object that can be awaited... the
+   results of `func` are 'immediately' available after it's called."** This is exactly the
+   `DecisionProvider` off-loop mechanism the plan needed, and it resolves the live/backtest
+   duality *for free* at the framework level — in backtest, `run_in_executor` degrades to a
+   direct synchronous call (fine, since `ReplayCommitteeProvider`'s cache lookup is already
+   synchronous and cheap); in live/paper, it genuinely schedules onto a registered executor off
+   the event-loop thread. N5's `on_bar` calls
+   `self.run_in_executor(self._deliberate_and_decide, args=(report,))`; `_deliberate_and_decide`
+   itself calls the (still separately async, for the rate limiter's sake)
+   `DecisionProvider.deliberate_async` and then does the sizing/order/journal sequence. Still
+   need to confirm in N0 live-connectivity testing: what executor `register_executor` should be
+   given in `node_live.py` (a `ThreadPoolExecutor` sized to the committee's concurrency needs is
+   the working assumption — ties into open question 11's staggered-warmup finding too).
 7. **`set_time_alert` semantics parity** between `BacktestEngine`'s simulated clock and
    `TradingNode`'s live clock — determines whether the dream cycle is backtestable.
 8. **Paper-account 2FA requirement** — determines whether unattended restart is even possible.
