@@ -210,3 +210,31 @@ def test_fund_state_is_configured_against_the_ib_account_venue_not_an_exchange()
     SMART or IDEALPRO - a fund trading both FX and equities still has one
     account/one equity figure."""
     assert str(node_live.IB_VENUE) == "INTERACTIVE_BROKERS"
+
+
+# ── watched_bar_types / bar_interval_seconds (Phase N8 staleness watchdog) ─
+
+def test_watched_bar_types_covers_the_whole_watchlist():
+    bar_types = node_live.watched_bar_types()
+    assert len(bar_types) == len(node_live.INSTRUMENT_IDS)
+
+
+def test_watched_bar_types_matches_build_strategies_own_bar_types():
+    """Phase N6 audit finding F1 was exactly two slightly-different copies
+    of this string-building logic drifting apart - pin that the shared
+    helper produces the identical strings build_strategies() actually
+    subscribes to, not just similarly-shaped ones."""
+    strategies = node_live.build_strategies(StubPolicyProvider(), _fund_state())
+    from_strategies = {str(s.config.bar_type) for s in strategies}
+    from_watched = set(node_live.watched_bar_types())
+    assert from_strategies == from_watched
+
+
+def test_bar_interval_seconds_maps_known_timeframes():
+    assert node_live.bar_interval_seconds("H1") == 3600
+    assert node_live.bar_interval_seconds("M15") == 900
+
+
+def test_bar_interval_seconds_rejects_an_unknown_timeframe():
+    with pytest.raises(ValueError, match="no bar-interval mapping"):
+        node_live.bar_interval_seconds("W1")

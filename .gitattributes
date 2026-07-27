@@ -1,0 +1,5 @@
+# Shell scripts run on Linux (the VPS, Phase N8's docker/vps-setup.sh and
+# docker/backup-data.sh) - a CRLF line ending on the #!/usr/bin/env bash shebang breaks
+# with "bad interpreter: no such file or directory" on checkout from a Windows clone with
+# core.autocrlf=true. Force LF regardless of the checking-out platform's git config.
+*.sh text eol=lf

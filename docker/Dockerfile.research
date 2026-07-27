@@ -1,0 +1,17 @@
+# Research image (vectorbt/Jupyter for backtest/sweep analysis) - deliberately separate
+# from docker/Dockerfile. vectorbt alone is a multi-hundred-MB dependency chain (numba,
+# LLVM, plotting stack) with no business in the image that runs unattended against a real
+# (paper) broker connection - see wit/research/__init__.py and the build plan §2. This
+# image is never built or started by `docker compose up`'s default target; it's its own
+# Compose profile (compose.research.yml), started explicitly.
+FROM python:3.12-slim AS base
+
+WORKDIR /app
+COPY pyproject.toml ./
+COPY wit ./wit
+
+RUN pip install --no-cache-dir ".[research]"
+
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8888
+ENTRYPOINT ["jupyter", "lab", "--ip=0.0.0.0", "--no-browser", "--allow-root"]

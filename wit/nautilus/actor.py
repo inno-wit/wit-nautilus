@@ -33,6 +33,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from nautilus_trader.common.actor import Actor, ActorConfig
+from nautilus_trader.core.datetime import unix_nanos_to_dt
+from nautilus_trader.model.data import BarType
 from nautilus_trader.model.identifiers import Venue
 
 from wit.config import CONFIG
@@ -91,6 +93,18 @@ class FundStateActorConfig(ActorConfig, frozen=True):
     dream_state_path: str
     account_currency: str = "USD"
     poll_interval_seconds: int = 30
+    # Staleness watchdog (Phase N8): the string form of every BarType this
+    # fund subscribes to, so the actor can check Cache.bar() itself without
+    # needing a live reference to each WitStrategy. Empty by default (opt-in)
+    # so backtests/sweeps that don't care about live data health are
+    # unaffected - node_live.py's build_node() populates it for the real
+    # paper/live node. IB's daily gateway restart makes "quietly blind"
+    # (subscribed but no bars arriving, no error either) a real failure
+    # mode even with the resubscription Nautilus itself handles.
+    watched_bar_types: tuple[str, ...] = ()
+    bar_interval_seconds: int = 3600  # matches CONFIG.timeframe="H1"; override if that changes
+    stale_alert_multiplier: float = 2.0   # alert once a bar is this many intervals late
+    stale_halt_multiplier: float = 6.0    # engage the kill switch once it's this late
 
 
 class FundStateActor(Actor):
@@ -110,6 +124,7 @@ class FundStateActor(Actor):
         self._start_of_day_equity: float | None = None
         self._day: object | None = None
         self._closed_pnls: list[tuple[int, float]] = []  # (ts_closed_ns, realized_pnl)
+        self._stale_symbols: set[str] = set()  # currently-alerted staleness state, to alert once per onset
         self.dream_state = dream_mod.load(config.dream_state_path)
         self.journal = journal or Journal(CONFIG.journal_path)
         self.committee = committee
@@ -295,6 +310,75 @@ class FundStateActor(Actor):
     def _poll_once(self) -> None:
         self._check_kill_switch()
         self._recompute_multipliers()
+        self._check_bar_staleness()
+
+    # -- bar staleness watchdog (Phase N8) ------------------------------------
+    def _check_bar_staleness(self) -> None:
+        """A bar type subscribed to but silently not producing fresh bars is
+        indistinguishable from a healthy quiet market unless something
+        actively checks the clock against the last bar seen - Nautilus's own
+        resubscription after IB's daily gateway restart fixes the
+        connection, not the operator's blindness to the gap while it
+        lasted. Reads ``Cache.bar()`` directly rather than going through any
+        strategy, so this has no dependency on WitStrategy internals and no
+        exposure to the NETTING position_id issue (bars aren't positions).
+
+        Two thresholds, both multiples of the configured bar interval: past
+        ``stale_alert_multiplier`` it alerts (once, on the transition into
+        staleness - not every poll); past ``stale_halt_multiplier`` it also
+        engages the kill switch, since a strategy silently blind to its own
+        instrument must not keep sizing/trading everything else as if nothing
+        were wrong."""
+        if not self.config.watched_bar_types:
+            return
+        now = self.clock.utc_now()
+        alert_after = timedelta(
+            seconds=self.config.bar_interval_seconds * self.config.stale_alert_multiplier
+        )
+        halt_after = timedelta(
+            seconds=self.config.bar_interval_seconds * self.config.stale_halt_multiplier
+        )
+
+        stale_now: set[str] = set()
+        dead: list[str] = []
+        for bar_type_str in self.config.watched_bar_types:
+            try:
+                bar_type = BarType.from_str(bar_type_str)
+            except ValueError:
+                continue
+            # The Nautilus/IB instrument id (e.g. "NVDA.NASDAQ",
+            # "EUR/USD.IDEALPRO"), not the watchlist's logical symbol
+            # ("NVDA", "EURUSD") - unambiguous and directly actionable for
+            # debugging without needing the symbol<->bar_type mapping only
+            # node_live.py's INSTRUMENT_IDS otherwise carries.
+            instrument = str(bar_type.instrument_id)
+            bar = self.cache.bar(bar_type)
+            if bar is None:
+                continue  # not staleness - warmup hasn't landed a first bar yet
+            age = now - unix_nanos_to_dt(bar.ts_event)
+            if age > alert_after:
+                stale_now.add(instrument)
+            if age > halt_after:
+                dead.append(instrument)
+
+        newly_stale = sorted(stale_now - self._stale_symbols)
+        recovered = sorted(self._stale_symbols - stale_now)
+        self._stale_symbols = stale_now
+
+        if newly_stale:
+            msg = f"[staleness] no fresh bar for {newly_stale} in > {alert_after}"
+            self.alerter.send(msg)
+            self.journal.log_event("bar_stale", msg, symbols=newly_stale, ts=now)
+        if recovered:
+            self.journal.log_event(
+                "bar_stale_recovered", f"{recovered} received a fresh bar again",
+                symbols=recovered, ts=now,
+            )
+        if dead and not self._halted:
+            reason = f"bar staleness: no data for {sorted(dead)} > {halt_after}"
+            self.engage_kill_switch(reason)
+            self.alerter.send(f"[staleness] HALTED: {reason}")
+            self.journal.log_event("bar_staleness_halt", reason, symbols=sorted(dead), ts=now)
 
     # -- kill switch -----------------------------------------------------------
     def _check_kill_switch(self) -> None:

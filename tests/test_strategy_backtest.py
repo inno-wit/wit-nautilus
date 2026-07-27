@@ -481,3 +481,110 @@ def test_fractional_kelly_reads_the_real_accumulated_sample(tmp_path, monkeypatc
     assert kelly_mult != 1.0, (
         "kelly_mult stayed at the disabled/empty-sample default despite a real accumulated sample"
     )
+
+
+# ── Phase N8: bar staleness watchdog ────────────────────────────────────────
+
+def _run_staleness_backtest(tmp_path, *, bars_n: int = 100, quotes_n: int = 150,
+                            stale_alert_multiplier: float = 2.0, stale_halt_multiplier: float = 6.0,
+                            poll_interval_seconds: int = 1800):
+    """Bars stop at hour `bars_n`; quotes (a separate Nautilus data type the
+    watchdog never reads) continue to hour `quotes_n`, keeping the engine's
+    simulated clock - and FundStateActor's poll timer - advancing for
+    `quotes_n - bars_n` more simulated hours after the watched bar type has
+    genuinely gone silent. BacktestEngine.run()'s own docs confirm this
+    matters: "timer advancement stops at data exhaustion" - a timer cannot
+    outlive the data adding the run's very last event, so something else
+    (here, quotes) must supply the trailing timeline for the watchdog to
+    have anything to poll during."""
+    instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")
+    venue = instrument.id.venue
+    engine = BacktestEngine(BacktestEngineConfig(logging=LoggingConfig(bypass_logging=True)))
+    engine.add_venue(venue=venue, oms_type=OmsType.NETTING, account_type=AccountType.MARGIN,
+                      base_currency=USD, starting_balances=[Money(50_000, USD)])
+    engine.add_instrument(instrument)
+    bar_type = BarType.from_str(f"{instrument.id}-1-HOUR-LAST-EXTERNAL")
+
+    full_frame = make_bars(n=quotes_n, drift=0.0, seed=7)
+    engine.add_data(_make_nautilus_bars(bar_type, instrument, full_frame.iloc[:bars_n]))
+    engine.add_data(_make_nautilus_quotes(instrument, full_frame))
+
+    from wit.ops.journal import Journal
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    fund_state = FundStateActor(
+        FundStateActorConfig(
+            venue=venue, kill_switch_file=str(tmp_path / "KILL"),
+            dream_state_path=str(tmp_path / "dream_state.json"),
+            watched_bar_types=(str(bar_type),), bar_interval_seconds=3600,
+            stale_alert_multiplier=stale_alert_multiplier,
+            stale_halt_multiplier=stale_halt_multiplier,
+            poll_interval_seconds=poll_interval_seconds,
+        ),
+        journal=journal,
+    )
+    engine.add_actor(fund_state)
+    engine.run()
+    engine.dispose()
+    return fund_state, journal
+
+
+def test_staleness_watchdog_alerts_then_halts_when_bars_stop_arriving(tmp_path, capsys):
+    fund_state, journal = _run_staleness_backtest(tmp_path)
+
+    assert fund_state.is_halted()
+    assert "bar staleness" in (fund_state.halt_reason or "")
+
+    out = capsys.readouterr().out
+    assert "[staleness]" in out and "no fresh bar" in out
+    assert "[staleness] HALTED" in out
+
+    kinds = [r.get("kind") for r in journal.read() if r.get("type") == "event"]
+    assert "bar_stale" in kinds
+    assert "bar_staleness_halt" in kinds
+
+
+def test_staleness_watchdog_alerts_only_once_per_onset(tmp_path, capsys):
+    """A symbol stuck stale for hours must not spam an alert on every
+    30-minute poll - only the transition into staleness is newsworthy."""
+    _run_staleness_backtest(tmp_path)
+    out = capsys.readouterr().out
+    assert out.count("no fresh bar") == 1
+
+
+def test_staleness_watchdog_does_not_fire_while_bars_keep_arriving(tmp_path):
+    """Regression guard: bars_n == quotes_n means nothing ever goes stale -
+    the watchdog must not false-positive on a healthy, continuously-fed
+    instrument."""
+    fund_state, _journal = _run_staleness_backtest(tmp_path, bars_n=100, quotes_n=100)
+    assert not fund_state.is_halted()
+    assert fund_state._stale_symbols == set()
+
+
+def test_staleness_watchdog_is_a_no_op_when_no_bar_types_are_watched(tmp_path):
+    """watched_bar_types defaults to () - every existing backtest/sweep that
+    doesn't set it must be completely unaffected by this phase."""
+    instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")
+    venue = instrument.id.venue
+    engine = BacktestEngine(BacktestEngineConfig(logging=LoggingConfig(bypass_logging=True)))
+    engine.add_venue(venue=venue, oms_type=OmsType.NETTING, account_type=AccountType.MARGIN,
+                      base_currency=USD, starting_balances=[Money(50_000, USD)])
+    engine.add_instrument(instrument)
+    bar_type = BarType.from_str(f"{instrument.id}-1-HOUR-LAST-EXTERNAL")
+    frame = make_bars(n=100, drift=0.0, seed=7)
+    engine.add_data(_make_nautilus_bars(bar_type, instrument, frame))
+    engine.add_data(_make_nautilus_quotes(instrument, frame))
+
+    from wit.ops.journal import Journal
+    fund_state = FundStateActor(
+        FundStateActorConfig(
+            venue=venue, kill_switch_file=str(tmp_path / "KILL"),
+            dream_state_path=str(tmp_path / "dream_state.json"),
+            poll_interval_seconds=1800,
+        ),
+        journal=Journal(str(tmp_path / "journal.jsonl")),
+    )
+    engine.add_actor(fund_state)
+    engine.run()
+    engine.dispose()
+
+    assert not fund_state.is_halted()

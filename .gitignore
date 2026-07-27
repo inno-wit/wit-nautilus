@@ -9,7 +9,11 @@ data/*.jsonl
 data/*.json
 data/*.db
 data/KILL_SWITCH
+data/.backup.log
 !data/.gitkeep
+backups/
+notebooks/*
+!notebooks/.gitkeep
 *.egg-info/
 dist/
 build/

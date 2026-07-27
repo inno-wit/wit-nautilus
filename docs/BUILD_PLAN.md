@@ -666,6 +666,49 @@ instrument within 2× the bar interval, alert; escalate to the kill switch after
 window. IB's daily gateway restart makes "quietly blind" a real failure mode even with the
 resubscription fix.
 
+**As shipped:** `docker/compose.yml` and `docker/Dockerfile` were N1 scaffold placeholders
+(explicit "completed in Phase N8" TODOs); both are now real. `ib-gateway` + `fund` on one
+user-defined bridge network (`internal` - not Compose's `internal: true` isolation, since
+both containers need outbound internet: `fund` for Anthropic/yfinance/Finnhub, `ib-gateway`
+for the actual IBKR connection), no API port published to the host either way - `fund`
+reaches `ib-gateway` by Compose service name (`IBG_HOST=ib-gateway`, `IBG_PORT=4002`,
+overriding `.env.example`'s local-TWS-on-Windows defaults inside the compose file itself).
+VNC stays `127.0.0.1:5900` only, reached over an SSH tunnel for the one-time paper-login/
+2FA session. The image ships no healthcheck of its own (confirmed against its README, not
+assumed) — `ib-gateway`'s is a direct TCP probe of the paper port via bash's `/dev/tcp`;
+`fund`'s uses `wit status` rather than `wit doctor` specifically because `doctor` makes a
+real Anthropic API call when a key is present, and a healthcheck firing every 60s would
+turn that into unbounded, silently-billed background API load. `:stable` floats — pinning
+by digest is left as an explicit operator step (the exact `docker inspect` command is in
+`compose.yml`'s own comments) rather than a digest hardcoded here that this session has no
+way to verify is current or correct. `docker/vps-setup.sh` (Docker Engine + Compose plugin,
+`ufw` allowing only 22, the deploy user added to the `docker` group) and
+`docker/backup-data.sh` (nightly `data/` tarball, 30-day retention, meant for cron on the
+host rather than inside a container so it survives any single container restart) are new -
+the build plan named both but neither existed yet. Research image
+(`docker/Dockerfile.research`, `vectorbt`/Jupyter) is its own Compose profile, mounts
+`data/` read-only (research must never write into the live journal), and is never part of
+`docker compose up`'s default target.
+
+The staleness watchdog lives in `FundStateActor._check_bar_staleness()`, polled alongside
+the existing kill-switch/multiplier checks rather than on its own timer. It reads
+`Cache.bar()` directly — not through any `WitStrategy` — so it has no dependency on
+strategy internals and, notably, no exposure to the NETTING `position_id` issue N7's audit
+spent two rounds on (bars aren't positions; `Cache` doesn't evict them). `watched_bar_types`
+is a tuple of bar-type strings on `FundStateActorConfig` (a plain, serializable field,
+unlike `journal`/`committee`/`alerter`) — empty by default, so every existing backtest/sweep
+is unaffected; `node_live.py`'s new `watched_bar_types()` populates it for the real node,
+sharing the exact bar-type-string construction `build_strategies()` uses (a dedicated
+`_bar_type_str()` helper, factored out specifically so this doesn't become a second copy of
+the string-building logic N6's audit finding F1 already burned once). Two thresholds, both
+multiples of the bar interval: past `stale_alert_multiplier` (default 2×) it alerts once, on
+the transition into staleness, not every 30-second poll; past `stale_halt_multiplier`
+(default 6×) it also engages the kill switch. Verified against a real `BacktestEngine` run,
+not a mock: bars for a symbol stop mid-backtest while a *different* Nautilus data type
+(quote ticks) keeps the engine's simulated clock — and the poll timer — advancing past that
+point (confirmed necessary: `BacktestEngine.run()`'s own docs state "timer advancement stops
+at data exhaustion", so a timer cannot outlive the run's very last event on its own).
+
 ### Phase N9 — Validation gate
 
 Mirrors the MT5 build's `doctor` → `once` → `once --execute` → `schedule --execute` discipline,

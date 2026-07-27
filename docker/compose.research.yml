@@ -1,13 +1,21 @@
-# vectorbt research image — separate Compose profile, never part of default `docker compose up`.
-# Run explicitly: docker compose -f docker/compose.yml -f docker/compose.research.yml --profile research up
-# Completed alongside Phase N8; the [research] extra is intentionally kept out of docker/Dockerfile.
+# vectorbt/Jupyter research image - a separate Compose profile, never started by
+# `docker compose up`'s default target (see compose.yml and Dockerfile.research's own
+# docstrings for why it's kept out of the trading image entirely).
 #
-# services:
-#   research:
-#     build:
-#       context: ..
-#       dockerfile: docker/Dockerfile.research   # TODO(N8): separate target, installs [research]
-#     profiles: [research]
-#     volumes:
-#       - ../data:/app/data
-#       - ../notebooks:/app/notebooks
+# Start explicitly:
+#   docker compose -f docker/compose.yml -f docker/compose.research.yml --profile research up -d research
+# Then open http://<vps-host>:8888 over an SSH tunnel (`ssh -L 8888:127.0.0.1:8888 user@vps`) -
+# port 8888 is loopback-bound here for the same reason VNC is in compose.yml.
+
+services:
+  research:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.research
+    profiles: [research]
+    ports:
+      - "127.0.0.1:8888:8888"
+    volumes:
+      - ../data:/app/data:ro   # read-only - research must never write into the live journal
+      - ../notebooks:/app/notebooks
+    restart: "no"   # an analysis session, not a service - start it when you need it

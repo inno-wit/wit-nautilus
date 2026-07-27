@@ -161,6 +161,36 @@ def build_config(ib: IBConfig | None = None) -> TradingNodeConfig:
     )
 
 
+def _bar_type_str(ib_id: str, price_type: PriceType) -> str:
+    """The one place a watchlist symbol's IB instrument id + price type
+    becomes a Nautilus bar-type string - shared by `build_strategies()` and
+    `watched_bar_types()` so the string is only ever assembled once. Phase
+    N6 audit finding F1 was exactly this string built wrong in two slightly
+    different ways in two places; do not reintroduce a second copy."""
+    return f"{ib_id}-{_bar_step(CONFIG.timeframe)}-{price_type.name}-EXTERNAL"
+
+
+def watched_bar_types() -> tuple[str, ...]:
+    """Every watchlist symbol's bar-type string, for
+    `FundStateActorConfig.watched_bar_types` (Phase N8's staleness
+    watchdog) - computed independently of `build_strategies()` since
+    `FundStateActor` is constructed before the strategies are, in
+    `build_node()`."""
+    return tuple(
+        _bar_type_str(ib_id, price_type)
+        for ib_id, price_type in INSTRUMENT_IDS.values()
+    )
+
+
+def bar_interval_seconds(timeframe: str) -> int:
+    """MT5-style timeframe -> seconds, for the staleness watchdog's alert/
+    halt thresholds (a multiple of this). Mirrors `_bar_step`'s coverage."""
+    mapping = {"M15": 900, "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400}
+    if timeframe not in mapping:
+        raise ValueError(f"no bar-interval mapping for timeframe {timeframe!r}")
+    return mapping[timeframe]
+
+
 def build_strategies(
     provider: DecisionProvider, fund_state: FundStateActor, journal: Journal | None = None,
 ) -> list[WitStrategy]:
@@ -179,7 +209,7 @@ def build_strategies(
         # instrument_id parsed as "NVDA.NASDAQ-1" - a phantom instrument
         # request_bars silently can't find, so on_start's warmup callback
         # never fires and the strategy never subscribes to anything.
-        bar_type = BarType.from_str(f"{ib_id}-{_bar_step(CONFIG.timeframe)}-{price_type.name}-EXTERNAL")
+        bar_type = BarType.from_str(_bar_type_str(ib_id, price_type))
         assert bar_type.instrument_id == instrument_id, (
             f"bar_type instrument mismatch: {bar_type.instrument_id} != {instrument_id}"
         )
@@ -239,6 +269,8 @@ def build_node() -> TradingNode:
             venue=IB_VENUE,
             kill_switch_file=CONFIG.safety.kill_switch_file,
             dream_state_path=CONFIG.dream.state_path,
+            watched_bar_types=watched_bar_types(),
+            bar_interval_seconds=bar_interval_seconds(CONFIG.timeframe),
         ),
         journal=journal, committee=provider, alerter=Alerter.from_env(),
     )
