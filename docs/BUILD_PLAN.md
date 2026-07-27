@@ -424,14 +424,41 @@ must not change at all** — if it does, the adapter boundary leaked.
    the working assumption — ties into open question 11's staggered-warmup finding too).
 7. **`set_time_alert` semantics parity** between `BacktestEngine`'s simulated clock and
    `TradingNode`'s live clock — determines whether the dream cycle is backtestable.
-8. **Paper-account 2FA requirement** — determines whether unattended restart is even possible.
-   Highest-priority N0 item.
-9. **Paper market-data subscription sharing with live** — determines `REALTIME` vs
-   `DELAYED_FROZEN` for the MVP.
-10. **`tick_value`-equivalent per instrument class**, confirmed only for US equities in theory —
-    N0's instrument table must exist before N4's shim is designed.
-11. **Concurrent 10-instrument warmup pacing** — issue #3718 (historical-request de-dup) may
-    force serialized/staggered warmup.
+8. **RESOLVED (live probe against TWS paper, `127.0.0.1:7497`, account `DUR305728`).** Login +
+   2FA already cleared by the user manually (this is inherently a human step — TWS was already
+   up and authenticated when probed). Confirmed via `reqAccountSummary`: `AccountType=INDIVIDUAL`,
+   `NetLiquidation=$1,000,000`, `BuyingPower=$4,000,000` — a real, funded paper account.
+   **New finding, not originally asked:** TWS's API is disabled by default even when TWS itself
+   is running — "Enable ActiveX and Socket Clients" must be checked manually in
+   Global Configuration → API → Settings before anything connects. Worth a callout in N6/N8's
+   runbook since it's an easy thing to forget on a fresh install.
+9. **PARTIALLY RESOLVED, and this is an action item for the account, not code.** Live-probed
+   both `reqMarketDataType(1)` (live) and `reqMarketDataType(3)` (delayed) against NVDA
+   (`SMART`/`NASDAQ`): **both fail with error 10089** ("Requested market data requires
+   additional subscription for API"). This paper account currently has **no US equities market
+   data entitlement at all**, not even the free 15-minute-delayed tier — that needs to be
+   enabled once in IBKR Account Management (Market Data Subscriptions), separate from anything
+   this codebase can do. **FX is unaffected**: `EURUSD` on `IDEALPRO` returned live ticks
+   immediately with zero subscription needed (bid/ask/close all populated) — IDEALPRO spot FX
+   data has always been free on IBKR, this confirms it still is. **Action for the user, before
+   N6**: enable US equities market data (the free delayed tier is enough for N9's early gates;
+   real-time is a paid add-on, cents/month, needed before live). Until then, `wit doctor`
+   should treat the equity leg of the watchlist as blocked and say so plainly rather than fail
+   opaquely.
+10. **RESOLVED for the confirmed watchlist** (live `reqContractDetails` probe, all 8 symbols
+    resolved cleanly): all 7 US equities (`NVDA`/`MSFT`/`AAPL`/`AMZN`/`GOOGL`/`META`/`TSLA`,
+    `STK`/`SMART`/`NASDAQ`) came back with `minTick=0.01`, `priceMagnifier=1` — confirms §1.3's
+    "US equities: 1 share = 1 unit, trivial" assumption exactly, no surprises. `EURUSD`
+    (`CASH`/`IDEALPRO`) resolved with `minTick=0.00005` (half-pip, 5-decimal quoting) — also
+    straightforward, not a blocker for the sizing shim. No futures/options in this watchlist, so
+    the harder `multiplier`-based case in §1.3 stays theoretical for now, as planned.
+11. **Partially resolved — single-request case is fast and clean, concurrency untested.** A
+    single-symbol `reqHistoricalData` (NVDA, 2 weeks of 15-min bars = 260 bars) completed in
+    **1.3 seconds**, no pacing violation, no error. This is a good sign but does **not** clear
+    the concurrent-warmup question — issue #3718's failure mode is specifically about *multiple
+    simultaneous* historical requests across strategy instances, which this single-symbol probe
+    doesn't exercise. Still needs a real 10-symbol concurrent test once N5's strategy code
+    exists to drive it (staggering is cheap insurance either way).
 12. **Whether the daily-restart resubscription fix (issue #3733, closed) is in the pinned
     version** — don't assume, verify.
 13. **IB's minimum stop distance behavior** — no `stops_level_points` equivalent found; the
@@ -448,6 +475,7 @@ must not change at all** — if it does, the adapter boundary leaked.
 
 | Risk | Mitigation |
 |---|---|
+| **CONFIRMED (N0, live):** this paper account has no US equities market data entitlement (error 10089 on both live and delayed) | User enables it once in IBKR Account Management before N6; `wit doctor` should detect and report this per-instrument-class rather than fail generically. FX is unaffected — confirmed working with zero subscription |
 | Committee latency blocks the event loop → missed fills/stale data | Off-loop `DecisionProvider` design; async rate limiter, never `time.sleep`; N0 confirms the mechanism before N5 |
 | `tick_value` shim wrong → position sizes off by an order of magnitude | N0's real instrument table; N4's gate is the MT5 sizing suite green on the new spec; first paper order on one instrument, watched |
 | Silent divergence between old/new desks | N2's byte-identical `as_prompt_block()` fixture gate |
