@@ -6,8 +6,12 @@ Linux-native build alongside the original MT5 build
 ([`Wit-Hedge-fund`](https://github.com/inno-wit/Wit-Hedge-fund)), which keeps running
 unchanged on its own Windows VPS.
 
-**Status: Phase N1 (scaffold) only.** No desks, no committee, no strategy, no IB wiring yet —
-see the build plan for the full phase sequence and why each thing is ordered the way it is.
+**Status: Phase N5 of N9 complete.** Desks (N2), LLM committee behind a `DecisionProvider`
+(N3), risk/sizing (N4), and `WitStrategy`/`FundStateActor` running against a real
+NautilusTrader `BacktestEngine` in backtest mode (N5) are done, each independently
+audited. Still to come: IB paper wiring (N6), CLI/journal/reflection/dream/alerts (N7),
+Docker/Compose on the VPS (N8), and the staged validation gate before any live money (N9).
+See the build plan for the full phase sequence and why each thing is ordered the way it is.
 
 ## Build plan
 

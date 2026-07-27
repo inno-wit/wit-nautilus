@@ -39,6 +39,11 @@ dev = [
     "mypy>=1.10",
     "wit-nautilus[quant]",
     "wit-nautilus[committee]",
+    # Phase N5: wit/nautilus/{strategy,actor}.py and their tests (including a real
+    # BacktestEngine smoke test) need core nautilus_trader - not the [ib] extra's
+    # adapter/ibapi weight, which nothing in this test suite exercises yet (that
+    # lands with Phase N6).
+    "nautilus_trader==1.230.0",
 ]
 
 [build-system]
