@@ -3,12 +3,18 @@ Anthropic API. Near-verbatim port of ``Wit-Hedge-fund/engine/agents_bridge.py``'
 ``Committee``/``_RateLimiter`` (Phase N3) — see ``wit/committee/provider.py``
 for why this stays synchronous rather than becoming an async rewrite.
 
-Defaults to direct Anthropic (``LLMConfig.base_url`` empty -> the SDK's own
-default endpoint) rather than a free-tier gateway: the MT5 build's own notes
-record its gateway (NaraRouter) silently substituting a different model than
-requested, which is a real-money risk for a system that places live orders.
-``served_model`` is still logged either way, since it's the only way to
-detect substitution if a gateway is used later.
+Two clients, split by decision authority rather than by call site: ``_pm_client``
+(direct Anthropic, ``LLMConfig.api_key``/``base_url``) drives the Portfolio
+Manager's tool-call verdict and the weekly ``dream`` cycle — the only calls
+that actually author a trade or a lesson fed back into future trading.
+``_quick_client`` (NaraRouter, ``LLMConfig.nara_api_key``/``nara_base_url``)
+drives the bull/bear researcher commentary, which the PM evaluates but never
+executes on directly. This still respects the Phase N3 design note's real-money
+concern (the MT5 build's own notes record NaraRouter silently substituting a
+different model than requested): a substituted researcher model degrades the
+debate's quality, but the PM — the only piece with decision authority — never
+runs through the substitution-prone gateway. ``served_model`` is still logged
+on the PM's verdict either way, since it's the only way to detect substitution.
 """
 from __future__ import annotations
 
@@ -78,24 +84,38 @@ class LiveCommitteeProvider:
         self.timeframe = timeframe or CONFIG.timeframe
         if not self.llm.api_key:
             raise ValueError("ANTHROPIC_API_KEY is not set — cannot run the committee")
-        # Fail fast on a half-configured .env: an empty model name makes every
-        # symbol quietly abstain to HOLD, indistinguishable from a real no-edge
-        # decision. One clear error at construction beats silent no-ops.
+        # Fail fast on a half-configured .env: an empty model name (or missing
+        # NaraRouter key) makes every symbol quietly abstain to HOLD,
+        # indistinguishable from a real no-edge decision. One clear error at
+        # construction beats silent no-ops.
         missing = [name for name, val in
                    (("WIT_DEEP_MODEL", self.llm.deep_model),
-                    ("WIT_QUICK_MODEL", self.llm.quick_model)) if not val]
+                    ("WIT_QUICK_MODEL", self.llm.quick_model),
+                    ("NARA_API_KEY", self.llm.nara_api_key)) if not val]
         if missing:
             raise ValueError(f"{' and '.join(missing)} not set in .env")
         import anthropic
 
-        client_kwargs: dict[str, Any] = {
+        pm_kwargs: dict[str, Any] = {
             "api_key": self.llm.api_key,
             "max_retries": 3,   # safety net on top of pacing — not so high it
             "timeout": 90.0,    # compounds into multi-minute stalls on its own
         }
         if self.llm.base_url:
-            client_kwargs["base_url"] = self.llm.base_url
-        self._client = anthropic.Anthropic(**client_kwargs)
+            pm_kwargs["base_url"] = self.llm.base_url
+        self._pm_client = anthropic.Anthropic(**pm_kwargs)
+        quick_kwargs: dict[str, Any] = {
+            "api_key": self.llm.nara_api_key,
+            "max_retries": 3,
+            "timeout": 90.0,
+        }
+        # Same guard as pm_kwargs above: an explicit-but-empty NARA_BASE_URL in
+        # .env (overriding LLMConfig's non-empty default) must not forward an
+        # empty base_url to the SDK — that's a malformed request URL, not "use
+        # the default", and would abstain every symbol to HOLD silently.
+        if self.llm.nara_base_url:
+            quick_kwargs["base_url"] = self.llm.nara_base_url
+        self._quick_client = anthropic.Anthropic(**quick_kwargs)
         self._limiter = _RateLimiter(self.llm.rpm_limit)
 
     # -- helpers ---------------------------------------------------------
@@ -105,7 +125,7 @@ class LiveCommitteeProvider:
 
     def _researcher(self, side: str, direction: str, symbol: str, context: str) -> str:
         self._limiter.wait()
-        msg = self._client.messages.create(
+        msg = self._quick_client.messages.create(
             model=self.llm.quick_model,
             max_tokens=600,
             system=_RESEARCHER_SYSTEM.format(
@@ -130,7 +150,7 @@ class LiveCommitteeProvider:
             f"Deliver your verdict on {symbol}."
         )
         self._limiter.wait()
-        msg = self._client.messages.create(
+        msg = self._pm_client.messages.create(
             model=self.llm.deep_model,
             max_tokens=1500,
             system=_PM_SYSTEM.format(symbol=symbol, timeframe=self.timeframe),
@@ -202,7 +222,7 @@ class LiveCommitteeProvider:
 
         try:
             self._limiter.wait()
-            msg = self._client.messages.create(
+            msg = self._pm_client.messages.create(
                 model=self.llm.deep_model,
                 max_tokens=800,
                 system=_DREAM_SYSTEM.format(

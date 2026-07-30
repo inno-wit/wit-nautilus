@@ -62,9 +62,14 @@ class FakeMessages:
 def build_committee(verdict=PM_VERDICT, fail: bool = False) -> LiveCommitteeProvider:
     c = LiveCommitteeProvider.__new__(LiveCommitteeProvider)  # bypass __init__'s API-key check
     c.llm = SimpleNamespace(quick_model="q", deep_model="d", api_key="test",
-                           rpm_limit=0)  # 0 = no throttling in tests
+                           nara_api_key="nara-test", rpm_limit=0)  # 0 = no throttling in tests
     c.timeframe = "H1"
-    c._client = SimpleNamespace(messages=FakeMessages(verdict, fail))
+    # Same fake backs both clients — FakeMessages already branches on whether
+    # `tools` is in the call kwargs (researcher vs PM turn), not on which
+    # client made the call.
+    fake = FakeMessages(verdict, fail)
+    c._pm_client = SimpleNamespace(messages=fake)
+    c._quick_client = SimpleNamespace(messages=fake)
     c._limiter = _RateLimiter(c.llm.rpm_limit)
     return c
 
@@ -124,7 +129,7 @@ def test_empty_pm_content_abstains(report):
 def test_empty_researcher_content_abstains(report):
     """Same regression, at the researcher call site instead of the PM's."""
     c = build_committee()
-    c._client.messages.create = lambda **kwargs: SimpleNamespace(
+    c._quick_client.messages.create = lambda **kwargs: SimpleNamespace(
         content=[], usage=SimpleNamespace(input_tokens=10, output_tokens=0),
         stop_reason="max_tokens",
     )
@@ -164,9 +169,11 @@ class FakeDreamMessages:
 
 def build_dream_committee(lessons, fail: bool = False) -> LiveCommitteeProvider:
     c = LiveCommitteeProvider.__new__(LiveCommitteeProvider)
-    c.llm = SimpleNamespace(quick_model="q", deep_model="d", api_key="test", rpm_limit=0)
+    c.llm = SimpleNamespace(quick_model="q", deep_model="d", api_key="test",
+                           nara_api_key="nara-test", rpm_limit=0)
     c.timeframe = "H1"
-    c._client = SimpleNamespace(messages=FakeDreamMessages(lessons, fail))
+    # dream() only ever calls the PM client.
+    c._pm_client = SimpleNamespace(messages=FakeDreamMessages(lessons, fail))
     c._limiter = _RateLimiter(c.llm.rpm_limit)
     return c
 
@@ -300,32 +307,67 @@ def test_rate_limiter_serializes_concurrent_callers():
 # in this file, which is how a broken rpm_limit reference on a real LLMConfig
 # survived to a commit: nothing ever exercised construction. These do.
 
-def test_init_constructs_a_real_client_and_wires_the_limiter(monkeypatch):
-    created = {}
+def test_init_constructs_pm_and_quick_clients_and_wires_the_limiter(monkeypatch):
+    calls: list[dict] = []
 
     class FakeAnthropic:
         def __init__(self, **kwargs):
-            created.update(kwargs)
+            calls.append(kwargs)
 
     monkeypatch.setitem(sys.modules, "anthropic", SimpleNamespace(Anthropic=FakeAnthropic))
 
-    llm = LLMConfig(api_key="test-key", deep_model="d", quick_model="q", rpm_limit=30)
+    llm = LLMConfig(
+        api_key="test-key", deep_model="d", quick_model="q",
+        nara_api_key="nara-key", nara_base_url="https://router.bynara.id",
+        rpm_limit=30,
+    )
     provider = LiveCommitteeProvider(llm=llm, timeframe="H1")
 
-    assert created["api_key"] == "test-key"
-    assert "base_url" not in created  # empty base_url must not be forwarded
+    assert len(calls) == 2  # PM client, then quick client
+    pm_kwargs, quick_kwargs = calls
+    assert pm_kwargs["api_key"] == "test-key"
+    assert "base_url" not in pm_kwargs  # empty base_url must not be forwarded
+    assert quick_kwargs["api_key"] == "nara-key"
+    assert quick_kwargs["base_url"] == "https://router.bynara.id"
     assert isinstance(provider._limiter, _RateLimiter)
     assert provider._limiter._min_interval == pytest.approx(2.0)  # 60/30
 
 
+def test_init_does_not_forward_an_explicitly_empty_nara_base_url(monkeypatch):
+    """opus-audit round 1 finding: an explicit-but-empty NARA_BASE_URL in .env
+    (overriding LLMConfig's non-empty default) must not reach the SDK as
+    ``base_url=""`` — that's a malformed request URL, not "use the default",
+    and would silently abstain every symbol to HOLD."""
+    calls: list[dict] = []
+
+    class FakeAnthropic:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setitem(sys.modules, "anthropic", SimpleNamespace(Anthropic=FakeAnthropic))
+
+    llm = LLMConfig(api_key="test-key", deep_model="d", quick_model="q",
+                    nara_api_key="nara-key", nara_base_url="", rpm_limit=30)
+    LiveCommitteeProvider(llm=llm, timeframe="H1")
+
+    _, quick_kwargs = calls
+    assert "base_url" not in quick_kwargs
+
+
 def test_init_rejects_a_missing_api_key():
-    llm = LLMConfig(api_key="", deep_model="d", quick_model="q")
+    llm = LLMConfig(api_key="", deep_model="d", quick_model="q", nara_api_key="nara-key")
     with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
         LiveCommitteeProvider(llm=llm)
 
 
+def test_init_rejects_a_missing_nara_api_key():
+    llm = LLMConfig(api_key="test-key", deep_model="d", quick_model="q", nara_api_key="")
+    with pytest.raises(ValueError, match="NARA_API_KEY"):
+        LiveCommitteeProvider(llm=llm)
+
+
 def test_init_rejects_missing_models():
-    llm = LLMConfig(api_key="test-key", deep_model="", quick_model="")
+    llm = LLMConfig(api_key="test-key", deep_model="", quick_model="", nara_api_key="nara-key")
     with pytest.raises(ValueError, match="WIT_DEEP_MODEL"):
         LiveCommitteeProvider(llm=llm)
 

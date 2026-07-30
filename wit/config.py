@@ -46,10 +46,18 @@ def _env_bool(key: str, default: bool = True) -> bool:
 
 @dataclass(frozen=True)
 class LLMConfig:
+    # PM client (wit/committee/live.py's ``_pm_client``) — the money-critical
+    # tool-call decision, kept on direct Anthropic per the Phase N3 design note.
     api_key: str = _env("ANTHROPIC_API_KEY")
     base_url: str = _env("ANTHROPIC_BASE_URL")  # empty -> Anthropic's default endpoint
     deep_model: str = _env("WIT_DEEP_MODEL")
+    # Quick client (``_quick_client``) — bull/bear researcher commentary only,
+    # routed through NaraRouter so it can be a free/non-Anthropic model. The PM
+    # alone holds decision authority, so a substituted researcher model is a
+    # quality risk, not the real-money risk the Phase N3 note warns about.
     quick_model: str = _env("WIT_QUICK_MODEL")
+    nara_api_key: str = _env("NARA_API_KEY")
+    nara_base_url: str = _env("NARA_BASE_URL", "https://router.bynara.id")
     # Paces LiveCommitteeProvider's bull/bear/PM calls (wit/committee/live.py's
     # _RateLimiter). Direct Anthropic accounts have materially higher limits than the
     # MT5 build's free-tier gateway did, so the default is higher than that build's 10 —

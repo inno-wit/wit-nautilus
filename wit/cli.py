@@ -48,6 +48,8 @@ def cmd_doctor(_: argparse.Namespace) -> int:
 
     if not CONFIG.llm.api_key:
         problems.append("ANTHROPIC_API_KEY is not set (.env)")
+    if not CONFIG.llm.nara_api_key:
+        problems.append("NARA_API_KEY is not set (.env)")
     if not CONFIG.llm.deep_model or not CONFIG.llm.quick_model:
         problems.append("WIT_DEEP_MODEL / WIT_QUICK_MODEL are not both set (.env)")
     if not CONFIG.ib.account_id:
@@ -60,26 +62,32 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     print(f"journal   : {CONFIG.journal_path}")
     print(f"kill sw   : {'ENGAGED' if Path(CONFIG.safety.kill_switch_file).exists() else 'clear'}")
 
-    if CONFIG.llm.api_key and CONFIG.llm.quick_model:
+    def _ping_llm(label: str, api_key: str, base_url: str, model: str) -> None:
+        """One round-trip against one of the committee's two clients (see
+        wit/committee/live.py's module docstring for the PM/quick split)."""
+        if not (api_key and model):
+            print(f"LLM {label:<5}: SKIPPED (see problems below)")
+            return
         try:
             import anthropic
 
-            client_kwargs = {"api_key": CONFIG.llm.api_key, "timeout": 30.0}
-            if CONFIG.llm.base_url:
-                client_kwargs["base_url"] = CONFIG.llm.base_url
+            client_kwargs = {"api_key": api_key, "timeout": 30.0}
+            if base_url:
+                client_kwargs["base_url"] = base_url
             client = anthropic.Anthropic(**client_kwargs)
             msg = client.messages.create(
-                model=CONFIG.llm.quick_model, max_tokens=16,
+                model=model, max_tokens=16,
                 messages=[{"role": "user", "content": "Reply with the single word: OK"}],
             )
             text = "".join(b.text for b in msg.content if b.type == "text").strip()
             served = (getattr(msg, "model", "") or "").strip()
-            print(f"LLM       : {CONFIG.llm.quick_model} responded {text!r}"
-                 f"{f' (served by {served})' if served and served != CONFIG.llm.quick_model else ''}")
+            print(f"LLM {label:<5}: {model} responded {text!r}"
+                 f"{f' (served by {served})' if served and served != model else ''}")
         except Exception as e:  # noqa: BLE001 - a doctor check must report, never crash
-            problems.append(f"LLM round-trip failed: {type(e).__name__}: {e}")
-    else:
-        print("LLM       : SKIPPED (see problems below)")
+            problems.append(f"{label} LLM round-trip failed: {type(e).__name__}: {e}")
+
+    _ping_llm("PM", CONFIG.llm.api_key, CONFIG.llm.base_url, CONFIG.llm.deep_model)
+    _ping_llm("quick", CONFIG.llm.nara_api_key, CONFIG.llm.nara_base_url, CONFIG.llm.quick_model)
 
     print("IB        : SKIPPED - live connectivity is verified attended, "
          "Phase N9's gate (see this module's docstring)")
