@@ -45,13 +45,18 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     """Config/env sanity plus a real LLM round-trip. IB connectivity is
     deliberately not checked here - see this module's docstring."""
     problems: list[str] = []
+    if CONFIG.committee_mode not in ("llm", "rules"):
+        problems.append(f"WIT_COMMITTEE_MODE={CONFIG.committee_mode!r} not recognized "
+                        f"(expected 'llm' or 'rules') - would raise, not silently run 'llm'")
+    rules_mode = CONFIG.committee_mode == "rules"
 
-    if not CONFIG.llm.api_key:
-        problems.append("ANTHROPIC_API_KEY is not set (.env)")
-    if not CONFIG.llm.nara_api_key:
-        problems.append("NARA_API_KEY is not set (.env)")
-    if not CONFIG.llm.deep_model or not CONFIG.llm.quick_model:
-        problems.append("WIT_DEEP_MODEL / WIT_QUICK_MODEL are not both set (.env)")
+    if not rules_mode:
+        if not CONFIG.llm.api_key:
+            problems.append("ANTHROPIC_API_KEY is not set (.env)")
+        if not CONFIG.llm.nara_api_key:
+            problems.append("NARA_API_KEY is not set (.env)")
+        if not CONFIG.llm.deep_model or not CONFIG.llm.quick_model:
+            problems.append("WIT_DEEP_MODEL / WIT_QUICK_MODEL are not both set (.env)")
     if not CONFIG.ib.account_id:
         problems.append("TWS_ACCOUNT is not set (.env) - needed for the paper_only boot assertion")
     if not CONFIG.safety.paper_only:
@@ -61,6 +66,8 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     print(f"paper_only: {CONFIG.safety.paper_only}")
     print(f"journal   : {CONFIG.journal_path}")
     print(f"kill sw   : {'ENGAGED' if Path(CONFIG.safety.kill_switch_file).exists() else 'clear'}")
+    print(f"committee : {CONFIG.committee_mode}"
+         f"{' (no LLM)' if rules_mode else ''}")
 
     def _ping_llm(label: str, api_key: str, base_url: str, model: str) -> None:
         """One round-trip against one of the committee's two clients (see
@@ -86,8 +93,11 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         except Exception as e:  # noqa: BLE001 - a doctor check must report, never crash
             problems.append(f"{label} LLM round-trip failed: {type(e).__name__}: {e}")
 
-    _ping_llm("PM", CONFIG.llm.api_key, CONFIG.llm.base_url, CONFIG.llm.deep_model)
-    _ping_llm("quick", CONFIG.llm.nara_api_key, CONFIG.llm.nara_base_url, CONFIG.llm.quick_model)
+    if rules_mode:
+        print("LLM       : SKIPPED (rules mode — no LLM committee, see wit/committee/rules.py)")
+    else:
+        _ping_llm("PM", CONFIG.llm.api_key, CONFIG.llm.base_url, CONFIG.llm.deep_model)
+        _ping_llm("quick", CONFIG.llm.nara_api_key, CONFIG.llm.nara_base_url, CONFIG.llm.quick_model)
 
     print("IB        : SKIPPED - live connectivity is verified attended, "
          "Phase N9's gate (see this module's docstring)")
@@ -196,13 +206,15 @@ def cmd_dream(args: argparse.Namespace) -> int:
     not silently overwrite the fund's live lessons file. Pass
     `--state-path` explicitly (e.g. `CONFIG.dream.state_path`) to update
     production deliberately."""
+    from wit.committee.provider import build_committee_provider
     from wit.ops import dream
     from wit.ops.journal import Journal
 
     try:
-        from wit.committee.live import LiveCommitteeProvider
-        committee = LiveCommitteeProvider()
+        committee = build_committee_provider()
     except ValueError as e:
+        # Only "llm" mode can raise here (a half-configured .env) - "rules"
+        # mode's RulePolicyProvider() never does.
         print(f"Cannot run the dream cycle: {e}")
         return 1
 

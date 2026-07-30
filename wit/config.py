@@ -201,6 +201,14 @@ class Config:
     timeframe: str = "H1"
     history_bars: int = 750
 
+    # "llm" (default): wit.committee.live.LiveCommitteeProvider.
+    # "rules": wit.committee.rules.RulePolicyProvider — deterministic, no LLM,
+    # no NaraRouter dependency, for both trade decisions and the weekly dream
+    # self-review. See wit/committee/rules.py. Mirrors the MT5 build's
+    # WIT_COMMITTEE_MODE switch (Wit-Hedge-fund/engine/config.py), adopted
+    # there after NaraRouter started silently 404ing on its VPS.
+    committee_mode: str = _env("WIT_COMMITTEE_MODE", "llm").lower()
+
     journal_path: str = str(PROJECT_ROOT / "data" / "journal.jsonl")
     decision_cache_path: str = str(PROJECT_ROOT / "data" / "decisions.db")
 

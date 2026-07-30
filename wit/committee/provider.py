@@ -33,10 +33,15 @@ See docs/BUILD_PLAN.md Phase N3.
 """
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from wit.committee.contract import CommitteeDecision
+from wit.config import CONFIG, Config
 from wit.desks.quant_analyst import QuantAnalystReport
+
+if TYPE_CHECKING:
+    from wit.committee.live import LiveCommitteeProvider
+    from wit.committee.rules import RulePolicyProvider
 
 
 @runtime_checkable
@@ -53,3 +58,29 @@ class DecisionProvider(Protocol):
         ``ReplayCommitteeProvider`` (they key its decision cache); live and
         stub providers ignore them."""
         ...
+
+
+_COMMITTEE_MODES = ("llm", "rules")
+
+
+def build_committee_provider(cfg: Config = CONFIG) -> "LiveCommitteeProvider | RulePolicyProvider":
+    """Construct the committee ``cfg.committee_mode`` selects (mirrors the MT5
+    build's ``Orchestrator.committee`` property). Imports are deferred so a
+    ``rules``-mode run never needs ``anthropic`` importable, or any LLM/
+    NaraRouter key set, just to construct a provider.
+
+    A typo'd ``WIT_COMMITTEE_MODE`` (e.g. ``"rule"``) must not silently fall
+    through to the ``llm`` branch below — that would run the exact LLM
+    committee the operator thought they'd turned off, with no warning
+    anywhere. Fail fast instead, same posture as ``LiveCommitteeProvider``'s
+    own half-configured-.env check."""
+    if cfg.committee_mode not in _COMMITTEE_MODES:
+        raise ValueError(
+            f"WIT_COMMITTEE_MODE={cfg.committee_mode!r} not recognized "
+            f"(expected one of {_COMMITTEE_MODES!r})"
+        )
+    if cfg.committee_mode == "rules":
+        from wit.committee.rules import RulePolicyProvider
+        return RulePolicyProvider()
+    from wit.committee.live import LiveCommitteeProvider
+    return LiveCommitteeProvider(llm=cfg.llm, timeframe=cfg.timeframe)

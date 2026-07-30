@@ -51,8 +51,7 @@ from nautilus_trader.model.data import BarType
 from nautilus_trader.model.enums import PriceType
 from nautilus_trader.model.identifiers import InstrumentId, TraderId
 
-from wit.committee.live import LiveCommitteeProvider
-from wit.committee.provider import DecisionProvider
+from wit.committee.provider import DecisionProvider, build_committee_provider
 from wit.config import CONFIG, IBConfig
 from wit.nautilus.actor import FundStateActor, FundStateActorConfig
 from wit.nautilus.strategy import WitStrategy, WitStrategyConfig
@@ -286,7 +285,7 @@ def build_node() -> TradingNode:
     ib = CONFIG.ib  # Phase N6 audit finding F10: read once, assert, and use
     assert_paper_only(ib)  # this exact object - not re-read separately by build_config.
 
-    provider = LiveCommitteeProvider()
+    provider = build_committee_provider()
     journal = Journal(CONFIG.journal_path)
     fund_state = FundStateActor(
         FundStateActorConfig(
