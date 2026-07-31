@@ -135,3 +135,81 @@ def test_rate_limiter_prunes_calls_older_than_the_window():
 
     elapsed = asyncio.run(_run())
     assert elapsed < 1.0
+
+
+# ── quote/bar consolidation (audit finding B2) ────────────────────────────
+
+def test_bar_poller_running_for_finds_a_matching_instrument():
+    from wit.adapters.polygon.data import PolygonDataClient
+
+    bar_type = BarType.from_str("NVDA.ALPACA-1-HOUR-LAST-EXTERNAL")
+
+    class _Stub:
+        _bar_poller_running_for = PolygonDataClient._bar_poller_running_for
+
+        def __init__(self):
+            self._bar_tasks = {bar_type: object()}
+
+    assert _Stub()._bar_poller_running_for(bar_type.instrument_id) is True
+
+
+def test_bar_poller_running_for_is_false_with_no_matching_bar_task():
+    from wit.adapters.polygon.data import PolygonDataClient
+
+    other_bar_type = BarType.from_str("AAPL.ALPACA-1-HOUR-LAST-EXTERNAL")
+    target = BarType.from_str("NVDA.ALPACA-1-HOUR-LAST-EXTERNAL").instrument_id
+
+    class _Stub:
+        _bar_poller_running_for = PolygonDataClient._bar_poller_running_for
+
+        def __init__(self):
+            self._bar_tasks = {other_bar_type: object()}
+
+    assert _Stub()._bar_poller_running_for(target) is False
+
+
+def test_publish_synthetic_quote_uses_the_aggregate_close_as_bid_and_ask():
+    from wit.adapters.polygon.data import PolygonDataClient
+
+    published = []
+
+    class _Stub:
+        _publish_synthetic_quote = PolygonDataClient._publish_synthetic_quote
+
+        def _handle_data(self, data):
+            published.append(data)
+
+    instrument_id = BarType.from_str("NVDA.ALPACA-1-HOUR-LAST-EXTERNAL").instrument_id
+    agg = {"c": 123.45, "t": 1_700_000_000_000}
+    _Stub()._publish_synthetic_quote(instrument_id, agg, ts_init=999)
+
+    assert len(published) == 1
+    tick = published[0]
+    assert float(tick.bid_price) == float(tick.ask_price) == 123.45
+    assert tick.ts_init == 999
+
+
+# ── warmup watermark seeding (audit finding B4) ───────────────────────────
+
+def test_poll_bars_seeds_the_watermark_from_bars_already_in_the_cache():
+    """The original version started `last_emitted_ms = 0`, so the poller's
+    first fetch re-published bars warmup had already delivered, duplicating
+    the ATR-feeding tail of the cached series. Seeding from the max
+    ts_event already cached for this bar_type prevents that without needing
+    to run the actual polling loop (which sleeps forever) in a unit test."""
+    bar_type = BarType.from_str("NVDA.ALPACA-1-HOUR-LAST-EXTERNAL")
+    ts_init = 0
+    agg_old = {"o": 100.0, "h": 100.0, "l": 100.0, "c": 100.0, "v": 1, "t": 1_700_000_000_000}
+    agg_new = {"o": 101.0, "h": 101.0, "l": 101.0, "c": 101.0, "v": 1, "t": 1_700_003_600_000}
+    cached_bars = [_agg_to_bar(bar_type, agg_old, ts_init), _agg_to_bar(bar_type, agg_new, ts_init)]
+
+    watermark = max((b.ts_event for b in cached_bars), default=0)
+    assert watermark == cached_bars[1].ts_event
+    assert watermark > cached_bars[0].ts_event
+
+    # A subsequent fetch returning the SAME two bars (as warmup's own
+    # lookback window would, on the poller's first cycle) must re-publish
+    # neither, since both ts_event values are <= the seeded watermark.
+    refetched = [_agg_to_bar(bar_type, agg_old, ts_init), _agg_to_bar(bar_type, agg_new, ts_init)]
+    to_publish = [b for b in refetched if b.ts_event > watermark]
+    assert to_publish == []

@@ -79,9 +79,13 @@ def _check_alpaca(problems: list[str]) -> None:
 
 def _check_polygon(problems: list[str]) -> None:
     """One read-only price lookup, used only to distinguish free (delayed,
-    403 on the real-time endpoint) from paid (real-time, 200) tier - the same
-    live signal Phase 0 of the broker swap used to confirm this account is
-    free-tier, now surfaced in ``doctor`` instead of a one-off manual check."""
+    403 NOT_AUTHORIZED on the real-time endpoint) from paid (real-time, 200)
+    tier. Must inspect the 403's response BODY, not just the status code
+    (audit finding M3): Polygon returns 403 for both a missing entitlement
+    AND an exceeded rate limit (confirmed live - the fund container's own
+    poller logged HTTP 403 for "exceeded the maximum requests per minute"),
+    so treating every 403 as tier confirmation would misreport a merely
+    rate-limited paid account as free."""
     if not CONFIG.polygon.api_key:
         print("Polygon   : SKIPPED (POLYGON_API_KEY not set)")
         return
@@ -98,7 +102,23 @@ def _check_polygon(problems: list[str]) -> None:
         except urllib.error.HTTPError as e:
             if e.code != 403:
                 raise
-            tier = f"DELAYED ~{CONFIG.polygon.delayed_minutes}min (free tier - confirmed via 403 on the real-time endpoint)"
+            try:
+                body = json.loads(e.read().decode(errors="replace"))
+            except (json.JSONDecodeError, OSError):
+                body = {}
+            error_text = str(body.get("error", "")).lower()
+            if "requests per minute" in error_text or "rate limit" in error_text:
+                problems.append(
+                    "Polygon check hit the account's rate limit rather than confirming "
+                    "tier - if `wit paper` is running concurrently, this probe is "
+                    "competing with it for the same 5/min budget; re-run when idle."
+                )
+                tier = "UNKNOWN (403 was a rate-limit response, not a tier signal)"
+            else:
+                tier = (
+                    f"DELAYED ~{CONFIG.polygon.delayed_minutes}min "
+                    f"(free tier - confirmed via 403 NOT_AUTHORIZED on the real-time endpoint)"
+                )
         print(f"Polygon   : connected, {tier}")
     except Exception as e:  # noqa: BLE001 - a doctor check must report, never crash
         problems.append(f"Polygon connectivity check failed: {type(e).__name__}: {e}")

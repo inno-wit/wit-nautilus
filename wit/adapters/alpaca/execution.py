@@ -119,6 +119,23 @@ def _qty(value) -> Quantity:
     return Quantity.from_str(str(value))
 
 
+def _parse_alpaca_time(value: str | None, clock: LiveClock) -> int:
+    """ISO-8601 timestamp string (Alpaca's activities ``transaction_time``) ->
+    UNIX nanoseconds. Falls back to the current clock if missing/unparseable -
+    a reconciliation report needs SOME ts_event, and a slightly-off timestamp
+    on a fallback is a far smaller problem than raising out of a
+    reconciliation pass entirely."""
+    if not value:
+        return clock.timestamp_ns()
+    try:
+        from datetime import datetime
+
+        dt = datetime.fromisoformat(value)  # py3.12 parses a trailing "Z" natively
+        return int(dt.timestamp() * 1_000_000_000)
+    except ValueError:
+        return clock.timestamp_ns()
+
+
 class AlpacaExecutionClient(LiveExecutionClient):
     """Execution client for Alpaca's paper trading REST + trade-update WebSocket
     (``alpaca.trading.client.TradingClient`` / ``alpaca.trading.stream.TradingStream``).
@@ -192,6 +209,20 @@ class AlpacaExecutionClient(LiveExecutionClient):
         await self._instrument_provider.initialize()
 
         account = await asyncio.to_thread(self._client.get_account)
+        # Post-connect PA-prefix confirmation (audit finding M4): node_live.py's
+        # assert_paper_only checks *configuration* (ALPACA_PAPER) before any
+        # connection opens, but the only way to know the account Alpaca actually
+        # returned is genuinely a paper account is to look at its number - this
+        # was previously only checked in `wit doctor`, a command the live process
+        # never runs, so the module docstring's claim of a watched confirmation
+        # was not true until this line. `alpaca-py` already makes a live account
+        # unreachable while `paper=True` holds (routes to the paper base URL
+        # unconditionally), so this is defense in depth, not the only guard.
+        if not str(account.account_number).startswith("PA"):
+            raise RuntimeError(
+                f"Alpaca account_number={account.account_number!r} does not start "
+                f"with 'PA' (the paper-account prefix) - refusing to proceed."
+            )
         self._set_account_id(AccountId(f"ALPACA-{account.account_number}"))
         self._publish_account_state(account)
 
@@ -206,13 +237,28 @@ class AlpacaExecutionClient(LiveExecutionClient):
             await self._stream.close()
 
     def _publish_account_state(self, account) -> None:
+        """``free`` is Alpaca's ``buying_power`` (what the risk/sizing margin
+        gate in ``wit/risk/sizing.py`` semantically wants), not ``cash`` —
+        cash falls as positions open and routinely goes negative on a margin
+        account well before buying power does, which would otherwise freeze
+        every subsequent order with no alert (audit finding H3). ``locked`` is
+        computed as the residual (``equity - free``, clamped so ``free`` never
+        exceeds ``equity``) rather than derived from ``equity - cash``
+        independently: ``AccountBalance`` hard-asserts ``total - locked ==
+        free``, and any open short position makes Alpaca's own ``cash >
+        equity`` (short market value is negative), which broke that
+        invariant and crashed ``_connect``/``QueryAccount`` outright (audit
+        finding H1). Computing ``locked`` as the residual makes the identity
+        hold by construction for every account state, not just the ones
+        tested by hand."""
         equity = Decimal(str(account.equity))
-        cash = Decimal(str(account.cash))
-        locked = max(equity - cash, Decimal(0))
+        buying_power = Decimal(str(account.buying_power))
+        free = min(max(buying_power, Decimal(0)), equity)
+        locked = equity - free
         balance = AccountBalance(
             total=Money(equity, _USD),
             locked=Money(locked, _USD),
-            free=Money(cash, _USD),
+            free=Money(free, _USD),
         )
         self.generate_account_state(
             balances=[balance],
@@ -540,32 +586,55 @@ class AlpacaExecutionClient(LiveExecutionClient):
         return reports
 
     async def generate_fill_reports(self, command: GenerateFillReports) -> list[FillReport]:
-        from alpaca.trading.requests import GetOrdersRequest
+        """Built from Alpaca's ``/account/activities`` FILL records, not
+        ``get_orders`` (audit finding H2). The prior version synthesized
+        ``trade_id=TradeId(str(order.id))`` here, while ``_on_trade_update``
+        uses the WebSocket's real ``update.execution_id`` for the identical
+        fill - two different ids for the same event, defeating Nautilus's
+        trade_id-keyed fill dedup and risking a double-applied fill on any
+        reconciliation after a restart with a position open. Each FILL
+        activity's own ``id`` is a composite ``"<time>::<uuid>"`` string
+        whose UUID segment is the same execution id the WebSocket sends,
+        so extracting it here makes both paths agree. This also fixes a
+        second, secondary defect the prior version had: one report per
+        ORDER (using its aggregate filled_qty), not one per actual partial
+        fill - the activities endpoint naturally returns one row per fill."""
+        params: dict = {"activity_types": "FILL"}
+        if command.start is not None:
+            params["after"] = command.start.isoformat()
+        if command.end is not None:
+            params["until"] = command.end.isoformat()
+        try:
+            activities = await asyncio.to_thread(self._client.get, "/account/activities", params)
+        except Exception as e:  # noqa: BLE001 - a reconciliation query must report, not crash
+            self._log.error(f"Failed to fetch Alpaca account activities: {type(e).__name__}: {e}")
+            activities = []
 
-        request = GetOrdersRequest(status="closed", limit=500)
-        orders = await asyncio.to_thread(self._client.get_orders, request)
         reports = []
-        for order in orders:
-            if order.client_order_id is None or order.filled_qty in (None, "0"):
+        for activity in activities or []:
+            order_id = activity.get("order_id")
+            symbol = activity.get("symbol")
+            if order_id is None or symbol is None:
                 continue
-            if command.instrument_id is not None and order.symbol != command.instrument_id.symbol.value:
+            if command.instrument_id is not None and symbol != command.instrument_id.symbol.value:
                 continue
-            side = OrderSide.BUY if order.side.value == "buy" else OrderSide.SELL
+            side = OrderSide.BUY if activity.get("side") == "buy" else OrderSide.SELL
+            raw_id = str(activity.get("id", ""))
+            trade_id_str = raw_id.rsplit("::", 1)[-1] if "::" in raw_id else raw_id
             reports.append(
                 FillReport(
                     account_id=self.account_id,
-                    instrument_id=_instrument_id_for(order.symbol),
-                    venue_order_id=VenueOrderId(str(order.id)),
-                    trade_id=TradeId(str(order.id)),
+                    instrument_id=_instrument_id_for(symbol),
+                    venue_order_id=VenueOrderId(str(order_id)),
+                    trade_id=TradeId(trade_id_str),
                     order_side=side,
-                    last_qty=_qty(order.filled_qty),
-                    last_px=_price_or_none(order.filled_avg_price) or Price.from_str("0"),
+                    last_qty=_qty(activity.get("qty", "0")),
+                    last_px=_price_or_none(activity.get("price")) or Price.from_str("0"),
                     commission=Money(Decimal(0), _USD),
                     liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
                     report_id=UUID4(),
-                    ts_event=self._clock.timestamp_ns(),
+                    ts_event=_parse_alpaca_time(activity.get("transaction_time"), self._clock),
                     ts_init=self._clock.timestamp_ns(),
-                    client_order_id=ClientOrderId(order.client_order_id),
                 ),
             )
         self._log_report_receipt(len(reports), "FillReport", self._log.info)

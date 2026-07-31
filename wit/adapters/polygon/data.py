@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import time
 import urllib.error
 import urllib.request
@@ -159,7 +160,19 @@ class PolygonDataClient(LiveMarketDataClient):
         self._poll_interval = config.poll_interval_secs
         self._limiter = _RateLimiter(config.max_requests_per_minute)
         self._bar_tasks: dict[BarType, asyncio.Task] = {}
-        self._quote_tasks: dict = {}
+        # Quotes piggyback on an existing bar poller for the same instrument
+        # wherever one exists (audit finding B2): `_poll_quotes`'s own 1-minute-
+        # aggregate fetch fell entirely inside the free tier's ~15min delayed-
+        # data entitlement window and 403'd on every single cycle - not a rate-
+        # limit fluke, a structurally unsatisfiable request. Deriving the
+        # synthetic quote from the SAME data `_poll_bars` already fetches
+        # halves total call volume (14 pollers -> 7) and removes the failing
+        # call shape outright, rather than just budgeting around it.
+        self._want_quotes: dict[object, bool] = {}
+        # Fallback only for an instrument that gets a quote subscription with
+        # no matching bar subscription - not exercised by strategy.py today
+        # (it always subscribes both together), kept for robustness.
+        self._standalone_quote_tasks: dict[object, asyncio.Task] = {}
 
     async def _connect(self) -> None:
         # `_instrument_provider`, not `instrument_provider` (no public alias
@@ -170,10 +183,11 @@ class PolygonDataClient(LiveMarketDataClient):
             self._handle_data(instrument)
 
     async def _disconnect(self) -> None:
-        for task in list(self._bar_tasks.values()) + list(self._quote_tasks.values()):
+        for task in list(self._bar_tasks.values()) + list(self._standalone_quote_tasks.values()):
             task.cancel()
         self._bar_tasks.clear()
-        self._quote_tasks.clear()
+        self._want_quotes.clear()
+        self._standalone_quote_tasks.clear()
         await self.cancel_pending_tasks()
 
     async def _fetch_aggs(
@@ -188,11 +202,30 @@ class PolygonDataClient(LiveMarketDataClient):
                 self._api_key,
                 adjusted="true", sort="asc", limit=str(limit),
             )
+        except urllib.error.HTTPError as e:
+            # Read the response body before it's gone (audit finding M1):
+            # Polygon's error JSON distinguishes NOT_AUTHORIZED (entitlement)
+            # from the rate-limit message, and the request shape (multiplier/
+            # timespan/window) is what actually identifies which poller failed
+            # - both were being discarded, which is why a systematic per-call-
+            # shape failure (see B2) read as an unexplained trickle instead.
+            try:
+                body = e.read().decode(errors="replace")[:300]
+            except Exception:  # noqa: BLE001 - body read is best-effort diagnostics
+                body = "<no body>"
+            self._log.error(
+                f"Polygon aggs request failed for {symbol} {multiplier}/{timespan} "
+                f"[{start_ms}, {end_ms}]: HTTP {e.code}: {body}"
+            )
+            return []
         except _PolygonError as e:
-            self._log.error(f"Polygon aggs request failed for {symbol}: {type(e).__name__}: {e}")
+            self._log.error(
+                f"Polygon aggs request failed for {symbol} {multiplier}/{timespan} "
+                f"[{start_ms}, {end_ms}]: {type(e).__name__}: {e}"
+            )
             return []
         if data.get("status") not in ("OK", "DELAYED"):
-            self._log.error(f"Polygon aggs error for {symbol}: {data}")
+            self._log.error(f"Polygon aggs error for {symbol} {multiplier}/{timespan}: {data}")
             return []
         return data.get("results", []) or []
 
@@ -209,12 +242,40 @@ class PolygonDataClient(LiveMarketDataClient):
 
         start_ms = int(request.start.timestamp() * 1000) if request.start else 0
         end_ms = int(request.end.timestamp() * 1000) if request.end else int(time.time() * 1000)
-        results = await self._fetch_aggs(symbol, multiplier, timespan, start_ms, end_ms)
+
+        # Equities only trade ~6.5h/24h calendar, ~5/7 days - a calendar-time
+        # lookback window (strategy.py's on_start) systematically under-yields
+        # actual trading-hour bars versus what request.limit asks for (audit
+        # finding B1: 6 of 7 watchlist symbols warmed up below the strategy's
+        # own 101-bar floor at the original window). Rather than hand-tune a
+        # multiplier that's really a property of Polygon's actual coverage,
+        # widen the window and retry, bounded, whenever the response falls
+        # short - self-healing regardless of the exact cause, and it logs
+        # loudly if it's still short after trying, instead of silently
+        # accepting too little data the way the original version did.
+        results: list[dict] = []
+        window_ms = end_ms - start_ms
+        for attempt in range(4):
+            results = await self._fetch_aggs(symbol, multiplier, timespan, start_ms, end_ms)
+            if not request.limit or len(results) >= request.limit or attempt == 3:
+                break
+            window_ms *= 3
+            start_ms = end_ms - window_ms
+            self._log.warning(
+                f"{symbol}: warmup returned {len(results)}/{request.limit} bars, "
+                f"widening lookback and retrying (attempt {attempt + 2}/4)"
+            )
 
         ts_init = self._clock.timestamp_ns()
         bars = [_agg_to_bar(bar_type, agg, ts_init) for agg in results]
         if request.limit and len(bars) > request.limit:
             bars = bars[-request.limit:]
+        if request.limit and len(bars) < request.limit:
+            self._log.error(
+                f"{symbol}: warmup delivered only {len(bars)}/{request.limit} bars after "
+                f"widening the lookback window - Polygon's available history for this "
+                f"symbol/timeframe is short of what was requested"
+            )
 
         self._handle_bars(bar_type, bars, request.id, request.start, request.end, request.params)
 
@@ -232,7 +293,18 @@ class PolygonDataClient(LiveMarketDataClient):
         if task is not None:
             task.cancel()
 
+    def _bar_poller_running_for(self, instrument_id) -> bool:
+        return any(bt.instrument_id == instrument_id for bt in self._bar_tasks)
+
     async def _poll_bars(self, bar_type: BarType) -> None:
+        """Publishes bars AND (when a quote subscription exists for the same
+        instrument, per `_want_quotes`) a synthetic quote derived from the
+        SAME fetched data - audit finding B2. Quotes no longer run their own
+        1-minute-aggregate poller: that call shape fell entirely inside the
+        free tier's ~15min delayed-data entitlement window and 403'd on every
+        single cycle, not just under rate-limit contention. Consolidating
+        halves total Polygon call volume (14 pollers -> 7) and removes the
+        failing shape outright rather than budgeting around it."""
         symbol = bar_type.instrument_id.symbol.value
         multiplier = bar_type.spec.step
         timespan = _POLYGON_TIMESPAN.get(bar_type.spec.aggregation)
@@ -240,7 +312,20 @@ class PolygonDataClient(LiveMarketDataClient):
             self._log.error(f"Cannot poll {bar_type}: unsupported aggregation for Polygon")
             return
 
-        last_emitted_ms = 0
+        # Seed the watermark from whatever warmup already delivered (audit
+        # finding B4): starting at 0 made this poller's first iteration
+        # re-emit the last few warmup bars a second time - Cache.add_bar has
+        # no timestamp dedup, so the duplicated tail reached ATR and therefore
+        # position size directly.
+        existing = self._cache.bars(bar_type)
+        last_emitted_ns = max((b.ts_event for b in existing), default=0)
+
+        # Jittered start (audit finding M2): without this, every poller for
+        # every symbol/subscription starts within about a second of each
+        # other at boot and stays phase-locked every cycle thereafter -
+        # unnecessary synchronized burst pressure on top of the rate limiter.
+        await asyncio.sleep(random.uniform(0, self._poll_interval))
+
         while True:
             now_ms = int(time.time() * 1000)
             lookback_ms = _bar_seconds(bar_type) * 1000 * 3
@@ -249,46 +334,66 @@ class PolygonDataClient(LiveMarketDataClient):
             )
             ts_init = self._clock.timestamp_ns()
             for agg in results:
-                if agg["t"] <= last_emitted_ms:
-                    continue
-                last_emitted_ms = agg["t"]
-                self._handle_data(_agg_to_bar(bar_type, agg, ts_init))
+                bar = _agg_to_bar(bar_type, agg, ts_init)
+                if bar.ts_event > last_emitted_ns:
+                    last_emitted_ns = bar.ts_event
+                    self._handle_data(bar)
+
+            if results and self._want_quotes.get(bar_type.instrument_id):
+                self._publish_synthetic_quote(bar_type.instrument_id, results[-1], ts_init)
+
             await asyncio.sleep(self._poll_interval)
+
+    def _publish_synthetic_quote(self, instrument_id, agg: dict, ts_init: int) -> None:
+        price = Price(agg["c"], _PRICE_PRECISION)
+        tick = QuoteTick(
+            instrument_id=instrument_id,
+            bid_price=price, ask_price=price,
+            bid_size=Quantity.from_int(0), ask_size=Quantity.from_int(0),
+            ts_event=agg["t"] * 1_000_000, ts_init=ts_init,
+        )
+        self._handle_data(tick)
 
     # -- live quotes (polled, synthetic - see module docstring on the free tier's
     #    lack of real NBBO) -------------------------------------------------------
     async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
         instrument_id = command.instrument_id
-        if instrument_id in self._quote_tasks:
+        if self._bar_poller_running_for(instrument_id):
+            # Piggyback on the existing bar poller (see _poll_bars) instead of
+            # starting a second, independent one - this is the path
+            # strategy.py always takes (subscribe_bars then
+            # subscribe_quote_ticks together in _on_warmup_complete).
+            self._want_quotes[instrument_id] = True
             return
-        self._quote_tasks[instrument_id] = self.create_task(
-            self._poll_quotes(instrument_id), log_msg=f"polygon_poll_quotes:{instrument_id}",
+        if instrument_id in self._standalone_quote_tasks:
+            return
+        self._standalone_quote_tasks[instrument_id] = self.create_task(
+            self._poll_quotes_standalone(instrument_id),
+            log_msg=f"polygon_poll_quotes:{instrument_id}",
         )
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
-        task = self._quote_tasks.pop(command.instrument_id, None)
+        instrument_id = command.instrument_id
+        self._want_quotes.pop(instrument_id, None)
+        task = self._standalone_quote_tasks.pop(instrument_id, None)
         if task is not None:
             task.cancel()
 
-    async def _poll_quotes(self, instrument_id) -> None:
-        """Free tier has no real bid/ask (last-quote/NBBO endpoints return 403
-        NOT_AUTHORIZED, confirmed in Phase 0) - publishes the latest 1-minute
-        aggregate's close as a synthetic bid==ask, an honest degradation rather
-        than a fabricated spread. `strategy.py`'s spread gate reads this as a
-        zero-spread quote, which only ever makes the spread gate MORE permissive,
-        never silently blocks a trade that should have gone through."""
+    async def _poll_quotes_standalone(self, instrument_id) -> None:
+        """Fallback path for a quote subscription with no matching bar
+        subscription - not exercised by strategy.py today (see
+        `_subscribe_quote_ticks`), kept for robustness. Uses the same
+        ascending-sort, take-the-last-result pattern `_poll_bars` uses rather
+        than `limit=1` (audit finding B3): with `sort="asc"` and `limit=1`,
+        Polygon returns the OLDEST bar in the window, not the newest -
+        `results[-1]` on a one-element list is a no-op, so the original
+        version's synthetic quote was up to five minutes stale before the
+        tier's own delay was even counted."""
         symbol = instrument_id.symbol.value
+        await asyncio.sleep(random.uniform(0, self._poll_interval))
         while True:
             now_ms = int(time.time() * 1000)
-            results = await self._fetch_aggs(symbol, 1, "minute", now_ms - 5 * 60_000, now_ms, limit=1)
+            results = await self._fetch_aggs(symbol, 1, "minute", now_ms - 5 * 60_000, now_ms, limit=5)
             if results:
-                agg = results[-1]
-                price = Price(agg["c"], _PRICE_PRECISION)
-                tick = QuoteTick(
-                    instrument_id=instrument_id,
-                    bid_price=price, ask_price=price,
-                    bid_size=Quantity.from_int(0), ask_size=Quantity.from_int(0),
-                    ts_event=agg["t"] * 1_000_000, ts_init=self._clock.timestamp_ns(),
-                )
-                self._handle_data(tick)
+                self._publish_synthetic_quote(instrument_id, results[-1], self._clock.timestamp_ns())
             await asyncio.sleep(self._poll_interval)

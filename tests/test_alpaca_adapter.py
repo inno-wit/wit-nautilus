@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import UTC
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -186,3 +187,126 @@ def test_order_to_report_maps_a_filled_order():
     assert report.avg_px == Decimal("123.45")
     from nautilus_trader.model.enums import OrderStatus as NautilusOrderStatus
     assert report.order_status == NautilusOrderStatus.FILLED
+
+
+# ── _publish_account_state: the AccountBalance invariant (audit finding H1/H3) ─
+
+def _account_state_for(equity: str, cash: str, buying_power: str) -> dict:
+    """Drives AlpacaExecutionClient._publish_account_state against a fake
+    Alpaca account and captures the AccountBalance it builds, without
+    constructing a full live client (no asyncio loop/msgbus/cache needed -
+    generate_account_state is stubbed out to just record its arguments)."""
+    from wit.adapters.alpaca.execution import AlpacaExecutionClient
+
+    captured = {}
+
+    class _Stub:
+        _clock = _FakeClock()
+        _publish_account_state = AlpacaExecutionClient._publish_account_state
+
+        def generate_account_state(self, balances, margins, reported, ts_event):
+            captured["balance"] = balances[0]
+
+    account = SimpleNamespace(equity=equity, cash=cash, buying_power=buying_power)
+    _Stub()._publish_account_state(account)
+    return captured["balance"]
+
+
+def test_account_balance_invariant_holds_on_a_normal_long_only_account():
+    balance = _account_state_for(equity="10000", cash="8000", buying_power="8000")
+    assert balance.total.as_decimal() - balance.locked.as_decimal() == balance.free.as_decimal()
+
+
+def test_account_balance_invariant_holds_when_cash_exceeds_equity():
+    """A short position makes Alpaca's own cash > equity (short market value
+    is negative) - the original `locked = max(equity - cash, 0)` mapping
+    clamped locked to 0 in this case while free stayed at cash, breaking
+    AccountBalance's hard total-locked==free assertion and crashing
+    _connect/QueryAccount outright (audit finding H1)."""
+    balance = _account_state_for(equity="9000", cash="9500", buying_power="7000")
+    assert balance.total.as_decimal() - balance.locked.as_decimal() == balance.free.as_decimal()
+    assert balance.locked.as_decimal() >= 0
+
+
+def test_account_balance_free_reflects_buying_power_not_bare_cash():
+    """Audit finding H3: mapping `free` from cash meant it could go negative
+    on a margin account well before buying power did, silently freezing the
+    sizing gate with no alert. `free` must track buying_power."""
+    balance = _account_state_for(equity="10000", cash="-500", buying_power="6000")
+    assert balance.free.as_decimal() == Decimal(6000)
+    assert balance.locked.as_decimal() >= 0
+
+
+def test_account_balance_free_never_exceeds_equity_even_with_excess_buying_power():
+    """Margin buying power can exceed equity (leverage) - free must still be
+    clamped so the AccountBalance invariant holds."""
+    balance = _account_state_for(equity="5000", cash="5000", buying_power="20000")
+    assert balance.free.as_decimal() <= balance.total.as_decimal()
+    assert balance.total.as_decimal() - balance.locked.as_decimal() == balance.free.as_decimal()
+
+
+# ── _parse_alpaca_time (used by generate_fill_reports, audit finding H2) ──
+
+def test_parse_alpaca_time_handles_a_z_suffixed_timestamp():
+    from datetime import datetime
+
+    from wit.adapters.alpaca.execution import _parse_alpaca_time
+
+    ns = _parse_alpaca_time("2026-07-31T12:00:00.000Z", _FakeClock())
+    expected = datetime(2026, 7, 31, 12, 0, 0, tzinfo=UTC)
+    assert ns == int(expected.timestamp() * 1_000_000_000)
+
+
+def test_parse_alpaca_time_falls_back_to_the_clock_on_missing_value():
+    from wit.adapters.alpaca.execution import _parse_alpaca_time
+
+    assert _parse_alpaca_time(None, _FakeClock()) == 999
+
+
+def test_parse_alpaca_time_falls_back_to_the_clock_on_unparseable_value():
+    from wit.adapters.alpaca.execution import _parse_alpaca_time
+
+    assert _parse_alpaca_time("not-a-timestamp", _FakeClock()) == 999
+
+
+# ── generate_fill_reports: trade_id from the activity id, not order.id ────
+
+def test_fill_report_trade_id_uses_the_activity_uuid_not_the_order_id():
+    """Audit finding H2: the prior version used TradeId(str(order.id)) here
+    while _on_trade_update uses the WebSocket's real execution_id for the
+    identical fill - two different ids for the same event defeats Nautilus's
+    trade_id-keyed fill dedup. Alpaca's activity id is a composite
+    "<time>::<uuid>" string whose UUID segment is the same execution id the
+    WebSocket sends."""
+    import asyncio as _asyncio
+
+    from wit.adapters.alpaca.execution import AlpacaExecutionClient
+
+    activity = {
+        "id": "20260731120000000::9c1c1234-5678-90ab-cdef-1234567890ab",
+        "order_id": "order-1", "symbol": "NVDA", "side": "buy",
+        "qty": "10", "price": "123.45", "transaction_time": "2026-07-31T12:00:00Z",
+    }
+
+    class _Stub:
+        account_id = "ALPACA-PA1"
+        _clock = _FakeClock()
+        _log = SimpleNamespace(error=lambda *a, **kw: None, info=lambda *a, **kw: None)
+        generate_fill_reports = AlpacaExecutionClient.generate_fill_reports
+
+        def _log_report_receipt(self, *a, **kw):
+            pass
+
+        class _client:
+            @staticmethod
+            def get(path, params):
+                return [activity]
+
+    class _Command:
+        instrument_id = None
+        start = None
+        end = None
+
+    reports = _asyncio.run(_Stub().generate_fill_reports(_Command()))
+    assert len(reports) == 1
+    assert str(reports[0].trade_id) == "9c1c1234-5678-90ab-cdef-1234567890ab"

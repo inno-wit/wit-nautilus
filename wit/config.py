@@ -90,15 +90,20 @@ class PolygonConfig:
     limits (Phase 0/1 of the broker swap: a real-time endpoint call 403'd, and
     a burst of watchlist-overlap checks independently hit the 5/min cap) —
     override only alongside a confirmed paid-tier upgrade, never speculatively.
-    ``poll_interval_secs`` default of 300s (not the swap's original 20s) came
-    from Phase 7's first deployed run: 7 symbols x 2 subscriptions (bars +
-    quotes) = 14 concurrent pollers, which at 20s each demanded ~42 req/min
-    against this 5/min account and tripped Polygon's server-side limiter
-    (403s across every symbol) even though the client-side limiter correctly
-    serialized dispatch - see wit/adapters/polygon/config.py's docstring."""
+    Two Phase 7 live-deploy rounds shaped these defaults: the first (20s
+    polling, independent bar+quote pollers) demanded ~42 req/min against this
+    5/min account; raising the interval to 300s alone did NOT fix it - a
+    second round showed a systematic 403 every cycle from the quote poller's
+    own call shape (a 1-minute-aggregate request wholly inside the free
+    tier's ~15min delayed-data entitlement window), not rate-limit
+    contention. The actual fix consolidates bar and quote polling into one
+    fetch per symbol (see wit/adapters/polygon/data.py's ``_poll_bars``),
+    halving call volume and removing the failing shape outright;
+    ``max_requests_per_minute``'s default of 4 (not the account's literal 5)
+    leaves margin on top of that rather than spending the full budget."""
 
     api_key: str = _env("POLYGON_API_KEY")
-    max_requests_per_minute: int = int(_env("POLYGON_MAX_RPM", "5") or "5")
+    max_requests_per_minute: int = int(_env("POLYGON_MAX_RPM", "4") or "4")
     poll_interval_secs: float = float(_env("POLYGON_POLL_INTERVAL_SECS", "300") or "300")
     delayed_minutes: int = int(_env("POLYGON_DELAYED_MINUTES", "15") or "15")
 
