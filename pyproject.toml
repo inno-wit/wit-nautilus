@@ -1,7 +1,7 @@
 [project]
 name = "wit-nautilus"
 version = "0.1.0"
-description = "Wit Hedge Fund's LLM committee + risk pipeline, ported to NautilusTrader over Interactive Brokers"
+description = "Wit Hedge Fund's LLM committee + risk pipeline, ported to NautilusTrader over Alpaca (execution) + Polygon (data)"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "python-dotenv>=1.0",
@@ -21,11 +21,27 @@ quant = [
 committee = [
     "anthropic>=0.40",
 ]
-# nautilus_trader==1.230.0 confirmed installable + IB adapter importable on this machine
-# (Python 3.13, Windows) during Phase N0's static-inspection pass. Pinned to that exact
-# version until a deliberate upgrade, since adapter config field names are load-bearing.
-ib = [
-    "nautilus_trader[ib]==1.230.0",
+# nautilus_trader==1.230.0 confirmed installable on this machine (Python 3.13, Windows)
+# during Phase N0's static-inspection pass. Pinned to that exact version until a
+# deliberate upgrade, since adapter config field names are load-bearing.
+#
+# Broker/data swap (docs/whatif-we-used-alpaca-quirky-aurora.md): IB replaced by a
+# three-way split - Alpaca (execution, paper), Polygon (bars, REST-polled on the
+# free/delayed tier), Alpha Vantage (enrichment, already optional via IntelConfig).
+# No official NautilusTrader adapter exists for either Alpaca or Polygon (unlike IB,
+# which shipped in nautilus_trader[ib]) - wit/adapters/{alpaca,polygon}/ are private,
+# in-repo LiveExecutionClient/LiveMarketDataClient implementations. Alpaca uses the
+# official alpaca-py SDK; Polygon uses plain REST (urllib, matching market_intel.py's
+# existing Finnhub pattern) rather than an unverified "massive-com/client-python"
+# package name, since the free tier is REST-polled anyway (no WS entitlement).
+alpaca = [
+    "alpaca-py>=0.33",
+    "nautilus_trader==1.230.0",
+    "wit-nautilus[quant]",
+    "wit-nautilus[committee]",
+]
+polygon = [
+    "nautilus_trader==1.230.0",
     "wit-nautilus[quant]",
     "wit-nautilus[committee]",
 ]
@@ -40,10 +56,10 @@ dev = [
     "wit-nautilus[quant]",
     "wit-nautilus[committee]",
     # Phase N5: wit/nautilus/{strategy,actor}.py and their tests (including a real
-    # BacktestEngine smoke test) need core nautilus_trader - not the [ib] extra's
-    # adapter/ibapi weight, which nothing in this test suite exercises yet (that
-    # lands with Phase N6).
+    # BacktestEngine smoke test) need core nautilus_trader - not the [alpaca] extra's
+    # alpaca-py weight, which the adapter's own mock-server tests exercise separately.
     "nautilus_trader==1.230.0",
+    "alpaca-py>=0.33",
 ]
 
 [build-system]

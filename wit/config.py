@@ -2,9 +2,14 @@
 
 Mirrors the MT5 build's config pattern (``Wit-Hedge-fund/engine/config.py``): a tiny
 ``.env`` parser, no third-party dependency required for env loading, typed frozen
-dataclasses per concern. Fields here are the ones confirmed by the plan
-(``docs`` cross-reference: ``whatif-we-used-alpaca-quirky-aurora.md``); IB and instrument
-fields will grow through Phase N4/N6 as Phase N0's findings land.
+dataclasses per concern.
+
+Broker/data swap (``docs/whatif-we-used-alpaca-quirky-aurora.md``): ``IBConfig``
+replaced by ``AlpacaConfig`` (execution, paper) + ``PolygonConfig`` (bars) — the
+three-way role split confirmed in Phase 0/1 of that swap (Alpaca account
+verified paper via a live auth check; Polygon confirmed free-tier/delayed via a
+live 403 on its real-time endpoint). ``AlphaVantageConfig`` is new too
+(enrichment, already-optional per ``IntelConfig``'s existing Finnhub slot).
 """
 from __future__ import annotations
 
@@ -66,11 +71,42 @@ class LLMConfig:
 
 
 @dataclass(frozen=True)
-class IBConfig:
-    host: str = _env("IBG_HOST", "127.0.0.1")
-    port: int = int(_env("IBG_PORT", "4002") or "4002")  # 4002 paper / 4001 live
-    client_id: int = int(_env("IBG_CLIENT_ID", "1") or "1")
-    account_id: str = _env("TWS_ACCOUNT")
+class AlpacaConfig:
+    """Execution-only (``wit/adapters/alpaca/``) — see that package's ``common.py``
+    module docstring for the single-venue design. ``paper`` must never be False
+    outside a deliberate, reviewed go-live; ``node_live.py``'s
+    ``assert_paper_only`` checks Alpaca's configured base URL independently of
+    this flag, mirroring the IB build's ``PAPER_PORTS``/``DU``-prefix check."""
+
+    api_key: str = _env("ALPACA_API_KEY")
+    secret_key: str = _env("ALPACA_SECRET_KEY")
+    paper: bool = _env_bool("ALPACA_PAPER", True)
+
+
+@dataclass(frozen=True)
+class PolygonConfig:
+    """Bar data only (``wit/adapters/polygon/``). ``max_requests_per_minute``/
+    ``poll_interval_secs`` default to the free tier's confirmed, live-verified
+    limits (Phase 0/1 of the broker swap: a real-time endpoint call 403'd, and
+    a burst of watchlist-overlap checks independently hit the 5/min cap) —
+    override only alongside a confirmed paid-tier upgrade, never speculatively."""
+
+    api_key: str = _env("POLYGON_API_KEY")
+    max_requests_per_minute: int = int(_env("POLYGON_MAX_RPM", "5") or "5")
+    poll_interval_secs: float = float(_env("POLYGON_POLL_INTERVAL_SECS", "20") or "20")
+    delayed_minutes: int = int(_env("POLYGON_DELAYED_MINUTES", "15") or "15")
+
+
+@dataclass(frozen=True)
+class AlphaVantageConfig:
+    """Enrichment only (``wit/desks/market_intel.py``'s Alpha Vantage slot,
+    alongside the existing Finnhub one). ``max_calls_per_day`` defaults to the
+    free tier's documented ceiling (25/day) — a hard budget, not a soft target,
+    since this API (unlike Finnhub) has no headroom to spend carelessly across
+    a multi-symbol watchlist."""
+
+    api_key: str = _env("ALPHAVANTAGE_API_KEY")
+    max_calls_per_day: int = int(_env("ALPHAVANTAGE_MAX_CALLS_PER_DAY", "25") or "25")
 
 
 @dataclass(frozen=True)
@@ -176,7 +212,9 @@ class DreamConfig:
 @dataclass(frozen=True)
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
-    ib: IBConfig = field(default_factory=IBConfig)
+    alpaca: AlpacaConfig = field(default_factory=AlpacaConfig)
+    polygon: PolygonConfig = field(default_factory=PolygonConfig)
+    alphavantage: AlphaVantageConfig = field(default_factory=AlphaVantageConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     intel: IntelConfig = field(default_factory=IntelConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -185,17 +223,16 @@ class Config:
     adaptive: AdaptiveConfig = field(default_factory=AdaptiveConfig)
     dream: DreamConfig = field(default_factory=DreamConfig)
 
-    # The build plan's own "Explicitly not doing" list scopes the first watchlist to
-    # US equities + major FX only (no metals/index/futures - "the two classes §1.3's
-    # sizing math can be confident about"). XAUUSD/US500 were carried over from the
-    # MT5 build's watchlist during the N2 config port without checking that against
-    # the plan's own stated scope; trimmed here once Phase N4's audit traced the
-    # consequence: wit/risk/instrument_spec.py's value_per_unit defaults to 1.0,
-    # which is correct for equities/FX but silently wrong (under-sizes the intended
-    # risk by the contract multiplier) for a futures-resolved XAUUSD/US500. Add
-    # metals/index back only alongside an explicit, non-default value_per_unit.
+    # EURUSD dropped as of the Alpaca/Polygon broker swap: Alpaca has no forex
+    # (execution-only, US equities), so the watchlist is equities-only going
+    # forward (build plan's "Architecture" section) - the seven NASDAQ names
+    # were already the only symbols Phase 1's watchlist-overlap check verified
+    # against both Alpaca and Polygon. Metals/index stay out per the prior
+    # scope note this replaces: wit/risk/instrument_spec.py's value_per_unit
+    # defaults to 1.0, correct for equities/FX but silently wrong for a
+    # futures-resolved instrument - add those back only alongside an explicit,
+    # non-default value_per_unit.
     watchlist: tuple[str, ...] = (
-        "EURUSD",
         "NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA",
     )
     timeframe: str = "H1"

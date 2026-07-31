@@ -1,19 +1,26 @@
-"""Assembles a live `TradingNode` against Interactive Brokers, paper-only by
-construction (build plan §1.4/§3 Phase N6).
+"""Assembles a live `TradingNode` against Alpaca (execution) + Polygon (data),
+paper-only by construction (build plan §1.4/§3 Phase N6; broker swap keeps this
+guarantee verbatim, see ``docs/whatif-we-used-alpaca-quirky-aurora.md``).
 
 **The `paper_only` boot assertion lives here** (§1.4's table names this as the
 guarantee's actual home): ``assert_paper_only()`` checks the *configured*
-account id prefix, port, and ``WIT_PAPER_ONLY`` flag — all known before any
+``WIT_PAPER_ONLY`` flag and ``AlpacaConfig.paper`` — both known before any
 socket opens — and raises rather than degrading. It runs before
-``node.build()``, so a misconfigured live account or a live port can never
-reach the point of resolving instruments or subscribing to data, let alone
-submitting an order.
+``node.build()``, so a misconfigured live account can never reach the point of
+resolving instruments or subscribing to data, let alone submitting an order.
+Unlike the IB build's port/account-prefix check, there is no config-only signal
+for whether an Alpaca API key is *actually* a paper key (that's only knowable
+after an authenticated `get_account()` call, which happens inside
+`AlpacaExecutionClient._connect`, after this assertion already ran) — so this
+assertion is necessary but not sufficient; the account number's `PA` prefix
+was confirmed live in Phase 0 of the swap, and should be watched on every
+first connection, not just assumed from config.
 
 **Strategies are assembled manually, not via Nautilus's config-driven
 `TradingNodeConfig(strategies=[...])`/`ImportableStrategyConfig` path**
-(Phase N5 audit finding F9): `WitStrategy.__init__` takes `provider`/
-`fund_state` as extra constructor arguments beyond Nautilus's own
-`config`-only convention, because those are live Python objects (a shared
+(Phase N5 audit finding F9, unchanged by the broker swap): `WitStrategy.__init__`
+takes `provider`/`fund_state` as extra constructor arguments beyond Nautilus's
+own `config`-only convention, because those are live Python objects (a shared
 rate-limited LLM client, a shared fund-state actor) that don't belong in a
 serializable config. `StrategyFactory.create` calls `strategy_cls(config=config)`
 and cannot construct this class — so `run()` builds the node with empty
@@ -21,81 +28,47 @@ and cannot construct this class — so `run()` builds the node with empty
 instance directly via `node.trader.add_actor()`/`add_strategy()` after
 `node.build()`.
 
-**The account is one venue, not one per exchange**: IB's adapter registers
-the account itself under the fixed pseudo-venue `IB_VENUE`
-("INTERACTIVE_BROKERS") — confirmed against the installed adapter, not
-assumed — separate from the *instrument-routing* venues (`SMART` for
-equities, `IDEALPRO` for FX) that appear in each `InstrumentId`. A single
-IB account trading both asset classes still has one equity figure, so
-`FundStateActor` is configured with `IB_VENUE`, giving it the fund-wide view
-the daily-loss breaker needs regardless of how many exchanges the watchlist
-touches.
+**Single venue, not one per exchange** (the broker swap's load-bearing design
+decision, verified in Phase 0 against the installed `nautilus_trader`'s
+`data/engine.pyx` `register_venue_routing`): every `InstrumentId` here uses
+`ALPACA_VENUE`, including the ones whose *bars* come from Polygon. This
+actually simplifies `WitStrategyConfig.account_venue` versus the IB build —
+IB needed an explicit override (`account_venue=IB_VENUE`) because its account
+lived under a different pseudo-venue than any instrument's own SMART/NASDAQ
+routing venue; here `instrument_id.venue` already IS `ALPACA_VENUE`, so the
+config's own default (`None` → resolved to `instrument_id.venue`) is correct
+without an override.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from nautilus_trader.adapters.interactive_brokers.common import IB_VENUE
-from nautilus_trader.adapters.interactive_brokers.config import (
-    InteractiveBrokersDataClientConfig,
-    InteractiveBrokersExecClientConfig,
-    InteractiveBrokersInstrumentProviderConfig,
-)
-from nautilus_trader.adapters.interactive_brokers.factories import (
-    InteractiveBrokersLiveDataClientFactory,
-    InteractiveBrokersLiveExecClientFactory,
-)
-from nautilus_trader.config import LiveExecEngineConfig, TradingNodeConfig
+from nautilus_trader.config import LiveExecEngineConfig, RoutingConfig, TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.enums import PriceType
 from nautilus_trader.model.identifiers import InstrumentId, TraderId
 
+from wit.adapters.alpaca.common import ALPACA_VENUE
+from wit.adapters.alpaca.config import AlpacaExecClientConfig, AlpacaInstrumentProviderConfig
+from wit.adapters.alpaca.factories import AlpacaLiveExecClientFactory
+from wit.adapters.polygon.config import PolygonDataClientConfig
+from wit.adapters.polygon.factories import PolygonLiveDataClientFactory
 from wit.committee.provider import DecisionProvider, build_committee_provider
-from wit.config import CONFIG, IBConfig
+from wit.config import CONFIG, AlpacaConfig
 from wit.nautilus.actor import FundStateActor, FundStateActorConfig
 from wit.nautilus.strategy import WitStrategy, WitStrategyConfig
 from wit.ops.alerts import Alerter
 from wit.ops.journal import Journal
 
-# 7497 = TWS paper, 4002 = native IB Gateway paper (build plan §3 Phase N6 /
-# Phase N0 confirmed live). 4004 = the ghcr.io/gnzsnz/ib-gateway Docker image's
-# paper port (Phase N8) - that image binds the *native* 4002 to the
-# container's own loopback only (verified against the image's published ports
-# table, not guessed) and republishes it via socat on 0.0.0.0:4004 for other
-# containers on the Compose network to reach; 4002 itself is never reachable
-# from wit-nautilus's own `fund` container. 7496/4001/4003 are the
-# corresponding LIVE ports (4003 is 4004's live-account sibling) and are
-# never accepted here, regardless of WIT_PAPER_ONLY.
-PAPER_PORTS = (7497, 4002, 4004)
-
 # Watchlist symbol (the logical, MT5-style form desks/committee/risk key
-# everything by) -> (Nautilus/IB InstrumentId string, bar price type).
-#
-# Phase N6 audit finding F2: the venue component of an IB equity InstrumentId
-# is that instrument's PRIMARY EXCHANGE, not its order-routing destination
-# (order routing to IB is always SMART regardless - confirmed against the
-# adapter's own _decode_stock_contract, which sets exchange="SMART" and
-# primaryExchange=<the venue you supplied>). "NVDA.SMART" therefore asks IB
-# for a contract whose primary exchange IS "SMART", which doesn't exist -
-# reqContractDetails returns error 200 for all seven equities. Re-probed
-# live against TWS paper (DUR305728) with .NASDAQ: all seven resolve to
-# exactly one contract each (conIds recorded in the N6 audit artifact).
-# EUR/USD.IDEALPRO was already correct - IDEALPRO is FX's real venue, not a
-# routing alias.
-#
-# Phase N6 audit finding F5: bar price type must be per-asset-class. IB has
-# no trade prints for CASH (FX) contracts, so LAST (-> "TRADES" in the
-# adapter) is rejected for EURUSD; it needs MID. Equities are fine with LAST.
+# everything by) -> (Nautilus InstrumentId string, bar price type). Equities
+# only as of the broker swap (EURUSD dropped - Alpaca has no forex, build
+# plan's "Architecture" section) - every entry uses the ALPACA venue and
+# PriceType.LAST (Alpaca/Polygon both report real trade prints for US equities,
+# unlike IB's CASH/FX contracts which needed MID).
 INSTRUMENT_IDS: dict[str, tuple[str, PriceType]] = {
-    "EURUSD": ("EUR/USD.IDEALPRO", PriceType.MID),
-    "NVDA": ("NVDA.NASDAQ", PriceType.LAST),
-    "MSFT": ("MSFT.NASDAQ", PriceType.LAST),
-    "AAPL": ("AAPL.NASDAQ", PriceType.LAST),
-    "AMZN": ("AMZN.NASDAQ", PriceType.LAST),
-    "GOOGL": ("GOOGL.NASDAQ", PriceType.LAST),
-    "META": ("META.NASDAQ", PriceType.LAST),
-    "TSLA": ("TSLA.NASDAQ", PriceType.LAST),
+    symbol: (f"{symbol}.ALPACA", PriceType.LAST) for symbol in CONFIG.watchlist
 }
 
 
@@ -105,76 +78,84 @@ class PaperOnlyViolation(RuntimeError):
     refuse to start, not to degrade or retry."""
 
 
-def assert_paper_only(ib: IBConfig | None = None) -> None:
+def assert_paper_only(alpaca: AlpacaConfig | None = None) -> None:
     """The paper_only hard lock (build plan §1.4), asserted at boot against
-    *configuration* the process already has - no IB connection is opened to
-    perform this check, so it can never be bypassed by a slow/failed
-    connection falling through to a live default."""
-    ib = ib or CONFIG.ib
+    *configuration* the process already has - no Alpaca connection is opened to
+    perform this check, so it can never be bypassed by a slow/failed connection
+    falling through to a live default. Necessary but not sufficient: see this
+    module's docstring for why the actual paper-account-number confirmation
+    can only happen after `AlpacaExecutionClient` authenticates."""
+    alpaca = alpaca or CONFIG.alpaca
     if not CONFIG.safety.paper_only:
         raise PaperOnlyViolation(
             "WIT_PAPER_ONLY is not set - refusing to boot a live-capable node. "
             "This is a hard lock and must never be relaxed from .env alone "
             "(build plan §1.4)."
         )
-    if ib.port not in PAPER_PORTS:
+    if not alpaca.paper:
         raise PaperOnlyViolation(
-            f"IBG_PORT={ib.port} is not a recognized paper port {PAPER_PORTS} "
-            f"(7497 TWS / 4002 native Gateway / 4004 dockerized ib-gateway) - refusing to boot."
+            "ALPACA_PAPER is not set - refusing to boot against Alpaca's live "
+            "trading API. This is a hard lock and must never be relaxed from "
+            ".env alone (build plan §1.4)."
         )
-    if not ib.account_id.startswith("DU"):
+    if not alpaca.api_key or not alpaca.secret_key:
         raise PaperOnlyViolation(
-            f"TWS_ACCOUNT={ib.account_id!r} does not start with 'DU' (the IBKR "
-            f"paper-account prefix) - refusing to boot. Live accounts start with 'U'."
+            "ALPACA_API_KEY/ALPACA_SECRET_KEY are not both set - refusing to boot."
         )
 
 
-def build_config(ib: IBConfig | None = None) -> TradingNodeConfig:
+def build_config(alpaca: AlpacaConfig | None = None) -> TradingNodeConfig:
     """The `TradingNode` config. Empty `strategies`/`actors` lists on purpose
     - see this module's docstring for why they're added manually after
     `node.build()` instead.
 
-    Phase N6 audit finding F9: asserts paper_only itself now too, rather than
-    relying solely on `build_node()`'s caller to have checked first - this
-    function returns a fully live-capable config given a live `IBConfig`, and
-    it's public."""
-    ib = ib or CONFIG.ib
-    assert_paper_only(ib)
-    instrument_ids = [pair[0] for pair in INSTRUMENT_IDS.values()]
-    provider_cfg = InteractiveBrokersInstrumentProviderConfig(
-        load_ids=frozenset(instrument_ids),
+    Phase N6 audit finding F9 (unchanged by the broker swap): asserts
+    paper_only itself too, rather than relying solely on `build_node()`'s
+    caller to have checked first - this function returns a fully live-capable
+    config given a live `AlpacaConfig`, and it's public."""
+    alpaca = alpaca or CONFIG.alpaca
+    assert_paper_only(alpaca)
+
+    instrument_ids = frozenset(
+        InstrumentId.from_str(pair[0]) for pair in INSTRUMENT_IDS.values()
     )
-    data_cfg = InteractiveBrokersDataClientConfig(
-        ibg_host=ib.host, ibg_port=ib.port, ibg_client_id=ib.client_id,
-        instrument_provider=provider_cfg,
-        use_regular_trading_hours=True,
-        # Phase N6 audit finding F6: explicit rather than the adapter default
-        # (REALTIME) - Phase N0 confirmed this paper account has no US equity
-        # market data entitlement (error 10089 on both live and delayed).
-        # DELAYED_FROZEN is the honest choice until that's enabled in IBKR
-        # Account Management; FX is unaffected either way.
-        market_data_type=1,  # 1=REALTIME - flip to 3 (DELAYED) if entitlement isn't enabled
+    provider_cfg = AlpacaInstrumentProviderConfig(
+        load_ids=instrument_ids,
+        api_key=alpaca.api_key, secret_key=alpaca.secret_key, paper=alpaca.paper,
     )
-    exec_cfg = InteractiveBrokersExecClientConfig(
-        ibg_host=ib.host, ibg_port=ib.port, ibg_client_id=ib.client_id,
-        account_id=ib.account_id,
+    exec_cfg = AlpacaExecClientConfig(
         instrument_provider=provider_cfg,
+        api_key=alpaca.api_key, secret_key=alpaca.secret_key, paper=alpaca.paper,
+    )
+    data_cfg = PolygonDataClientConfig(
+        instrument_provider=provider_cfg,
+        api_key=CONFIG.polygon.api_key,
+        max_requests_per_minute=CONFIG.polygon.max_requests_per_minute,
+        poll_interval_secs=CONFIG.polygon.poll_interval_secs,
+        delayed_minutes=CONFIG.polygon.delayed_minutes,
+        alpaca_api_key=alpaca.api_key, alpaca_secret_key=alpaca.secret_key,
+        alpaca_paper=alpaca.paper,
+        # Polygon's own client venue is None (see PolygonDataClient's docstring);
+        # this is what makes the DataEngine send ALPACA-addressed data commands
+        # to the "POLYGON" client_id - the broker swap's load-bearing design
+        # decision, verified in Phase 0 (data/engine.pyx's register_venue_routing).
+        routing=RoutingConfig(venues=frozenset({str(ALPACA_VENUE)})),
     )
     return TradingNodeConfig(
         trader_id=TraderId("WIT-001"),
         exec_engine=LiveExecEngineConfig(reconciliation=True),
-        data_clients={"IB": data_cfg},
-        exec_clients={"IB": exec_cfg},
+        data_clients={"POLYGON": data_cfg},
+        exec_clients={"ALPACA": exec_cfg},
     )
 
 
-def _bar_type_str(ib_id: str, price_type: PriceType) -> str:
-    """The one place a watchlist symbol's IB instrument id + price type
-    becomes a Nautilus bar-type string - shared by `build_strategies()` and
-    `watched_bar_types()` so the string is only ever assembled once. Phase
-    N6 audit finding F1 was exactly this string built wrong in two slightly
-    different ways in two places; do not reintroduce a second copy."""
-    return f"{ib_id}-{_bar_step(CONFIG.timeframe)}-{price_type.name}-EXTERNAL"
+def _bar_type_str(instrument_id: str, price_type: PriceType) -> str:
+    """The one place a watchlist symbol's instrument id + price type becomes a
+    Nautilus bar-type string - shared by `build_strategies()` and
+    `watched_bar_types()` so the string is only ever assembled once (IB build's
+    Phase N6 audit finding F1 was exactly this string built wrong in two
+    slightly different ways in two places; do not reintroduce a second copy)."""
+    return f"{instrument_id}-{_bar_step(CONFIG.timeframe)}-{price_type.name}-EXTERNAL"
 
 
 def watched_bar_types() -> dict[str, str]:
@@ -182,51 +163,35 @@ def watched_bar_types() -> dict[str, str]:
     `FundStateActorConfig.watched_bar_types` (Phase N8's staleness
     watchdog) - computed independently of `build_strategies()` since
     `FundStateActor` is constructed before the strategies are, in
-    `build_node()`. A dict, not a bare tuple of bar-type strings (Phase N8
-    audit finding C1): the watchdog needs the logical watchlist symbol
-    (e.g. "EURUSD"), not just the Nautilus/IB instrument id, to ask
-    `wit.ops.market_hours` whether that symbol's market is even open right
-    now."""
+    `build_node()`."""
     return {
-        symbol: _bar_type_str(ib_id, price_type)
-        for symbol, (ib_id, price_type) in INSTRUMENT_IDS.items()
+        symbol: _bar_type_str(instrument_id, price_type)
+        for symbol, (instrument_id, price_type) in INSTRUMENT_IDS.items()
     }
 
 
 def build_strategies(
     provider: DecisionProvider, fund_state: FundStateActor, journal: Journal | None = None,
 ) -> list[WitStrategy]:
-    """One `WitStrategy` per watchlist symbol with a known IB instrument id."""
+    """One `WitStrategy` per watchlist symbol."""
     strategies = []
     for symbol in CONFIG.watchlist:
         pair = INSTRUMENT_IDS.get(symbol)
         if pair is None:
             continue
-        ib_id, price_type = pair
-        instrument_id = InstrumentId.from_str(ib_id)
-        # Phase N6 audit finding F1: this used to read
-        # f"{ib_id}-1-{_bar_step(...)}-LAST-EXTERNAL" - _bar_step already
-        # returns "1-HOUR" (the step token includes the leading "1"), so the
-        # extra literal "-1-" duplicated it, producing a bar type whose
-        # instrument_id parsed as "NVDA.NASDAQ-1" - a phantom instrument
-        # request_bars silently can't find, so on_start's warmup callback
-        # never fires and the strategy never subscribes to anything.
-        bar_type = BarType.from_str(_bar_type_str(ib_id, price_type))
+        alpaca_id, price_type = pair
+        instrument_id = InstrumentId.from_str(alpaca_id)
+        bar_type = BarType.from_str(_bar_type_str(alpaca_id, price_type))
         assert bar_type.instrument_id == instrument_id, (
             f"bar_type instrument mismatch: {bar_type.instrument_id} != {instrument_id}"
         )
         config = WitStrategyConfig(
             instrument_id=instrument_id, bar_type=bar_type, symbol=symbol,
             timeframe=CONFIG.timeframe, history_bars=CONFIG.history_bars,
-            # Phase N6 audit finding F4: the account lives under IB_VENUE
-            # ("INTERACTIVE_BROKERS"), never under an instrument's own
-            # SMART/NASDAQ/IDEALPRO venue - WitStrategyConfig defaults
-            # account_venue to the instrument venue (so N5's single-venue
-            # backtest is unaffected), so IB wiring must override it
-            # explicitly or every decision dies at "no_account_snapshot".
-            account_venue=IB_VENUE,
-            # Live/paper only (Phase N7) - see WitStrategyConfig's docstring
-            # for why a backtest must never make this call.
+            # No account_venue override needed (unlike the IB build's IB_VENUE
+            # override) - instrument_id.venue is already ALPACA_VENUE, which is
+            # WitStrategyConfig's own default resolution. See this module's
+            # docstring for why the broker swap simplifies this away.
             enable_market_intel=True,
         )
         strategies.append(WitStrategy(config, provider=provider, fund_state=fund_state,
@@ -235,12 +200,10 @@ def build_strategies(
 
 
 # MT5-style timeframe -> (Nautilus BarType step string, seconds). One table,
-# not two (Phase N8 audit finding I3): _bar_step and bar_interval_seconds
-# used to maintain separate mappings over the same five timeframes, the same
-# duplication shape N6's audit finding F1 already burned once for bar-type
-# strings themselves. Only the step used by the current watchlist
-# (CONFIG.timeframe = "H1") is exercised; extend when a per-symbol timeframe
-# is actually needed.
+# not two (IB build's Phase N8 audit finding I3, unchanged by the broker swap):
+# _bar_step and bar_interval_seconds used to maintain separate mappings over
+# the same five timeframes. Only H1 (CONFIG.timeframe) is exercised currently;
+# extend when a per-symbol timeframe is actually needed.
 _TIMEFRAMES: dict[str, tuple[str, int]] = {
     "M15": ("15-MINUTE", 900),
     "M30": ("30-MINUTE", 1800),
@@ -271,25 +234,26 @@ def build_node() -> TradingNode:
     factories registered, `node.build()` called) but does NOT call
     `node.run()` - kept separate so tests can exercise everything up to a
     live connection without one. Note `node.build()` itself opens no socket
-    (it only constructs the data/exec clients); the actual IB connection
-    happens later, inside `node.run()`.
+    (it only constructs the data/exec clients); the actual Alpaca/Polygon
+    connections happen later, inside `node.run()`.
 
-    Phase N6 audit finding F7: every fallible non-IB object (the committee
-    provider, which raises loudly on missing LLM config per Phase N3's
-    design; the fund-state actor; the journal) is now constructed BEFORE
-    `node.build()`, not after - previously a missing ANTHROPIC_API_KEY would
-    raise only after the IB clients were already built, leaving `node` a
-    local with no `dispose()` call reached. Everything from `node.build()`
-    onward is now wrapped so a failure disposes the node instead of leaking
-    the kernel and the adapter's cached IB client."""
-    ib = CONFIG.ib  # Phase N6 audit finding F10: read once, assert, and use
-    assert_paper_only(ib)  # this exact object - not re-read separately by build_config.
+    Phase N6 audit finding F7 (unchanged by the broker swap): every fallible
+    non-broker object (the committee provider, which raises loudly on missing
+    LLM config per Phase N3's design; the fund-state actor; the journal) is
+    constructed BEFORE `node.build()`, not after - a missing ANTHROPIC_API_KEY
+    must raise before the Alpaca/Polygon clients are already built, leaving
+    `node` a local with no `dispose()` call reached. Everything from
+    `node.build()` onward is wrapped so a failure disposes the node instead of
+    leaking the kernel and the adapters' cached Alpaca client/stream."""
+    alpaca = CONFIG.alpaca  # Phase N6 audit finding F10 (unchanged): read once,
+    assert_paper_only(alpaca)  # assert, and use this exact object - not re-read
+                               # separately by build_config.
 
     provider = build_committee_provider()
     journal = Journal(CONFIG.journal_path)
     fund_state = FundStateActor(
         FundStateActorConfig(
-            venue=IB_VENUE,
+            venue=ALPACA_VENUE,
             kill_switch_file=CONFIG.safety.kill_switch_file,
             dream_state_path=CONFIG.dream.state_path,
             watched_bar_types=watched_bar_types(),
@@ -299,11 +263,11 @@ def build_node() -> TradingNode:
         journal=journal, committee=provider, alerter=Alerter.from_env(),
     )
 
-    config = build_config(ib)
+    config = build_config(alpaca)
     node = TradingNode(config=config)
     try:
-        node.add_data_client_factory("IB", InteractiveBrokersLiveDataClientFactory)
-        node.add_exec_client_factory("IB", InteractiveBrokersLiveExecClientFactory)
+        node.add_data_client_factory("POLYGON", PolygonLiveDataClientFactory)
+        node.add_exec_client_factory("ALPACA", AlpacaLiveExecClientFactory)
         node.build()
 
         node.trader.add_actor(fund_state)
@@ -318,11 +282,11 @@ def build_node() -> TradingNode:
 
 def run() -> None:
     """Boots the live paper-trading node and blocks until stopped
-    (Ctrl+C / SIGTERM). See the build plan's Phase N6 gate: node connects,
-    instruments resolve, warmup+live bars arrive, one bracket order fills
-    on paper and appears in the journal - all of which require manually
-    watching a real run against TWS, not something this function proves by
-    itself."""
+    (Ctrl+C / SIGTERM). See the build plan's Phase N6 gate, re-run for the
+    broker swap (Phase 7's staged validation): node connects, instruments
+    resolve, warmup+live bars arrive, one bracket order fills on paper and
+    appears in the journal - all of which require manually watching a real run
+    against Alpaca's paper API, not something this function proves by itself."""
     node = build_node()
     try:
         node.run()

@@ -3,14 +3,15 @@
 Real desk/committee/risk/nautilus tests land in their owning phases (N2-N7).
 """
 from wit.cli import build_parser, cmd_doctor
-from wit.config import CONFIG, IBConfig, LLMConfig, SafetyConfig
+from wit.config import CONFIG, AlpacaConfig, LLMConfig, PolygonConfig, SafetyConfig
 
 
 def test_config_loads_with_typed_defaults():
     assert isinstance(CONFIG.llm, LLMConfig)
-    assert isinstance(CONFIG.ib, IBConfig)
+    assert isinstance(CONFIG.alpaca, AlpacaConfig)
+    assert isinstance(CONFIG.polygon, PolygonConfig)
     assert isinstance(CONFIG.safety, SafetyConfig)
-    assert CONFIG.ib.port == 4002  # paper by default until .env overrides it
+    assert CONFIG.alpaca.paper is True  # paper by default until .env overrides it
     assert CONFIG.safety.paper_only is True
 
 

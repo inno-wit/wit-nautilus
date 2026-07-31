@@ -5,19 +5,23 @@ Phase N7 adds the rest of the build plan's CLI surface: ``doctor`` grows a
 real LLM round-trip check; ``halt``/``resume``/``status`` operate the kill
 switch directly (the same file ``FundStateActor`` polls); ``review``/
 ``dream`` manually fire the Phase N7 ops modules against the journal;
-``paper``/``live`` boot the Phase N6 IB node (``live`` needs an explicit
-``--i-know``, since it's the command that actually calls ``node.run()``
-unattended against a connected broker).
+``paper``/``live`` boot the live node against Alpaca (execution) + Polygon
+(data) (``live`` needs an explicit ``--i-know``, since it's the command that
+actually calls ``node.run()`` unattended against a connected broker).
 
-**Deliberately NOT added here**: a live IB connectivity/instrument-resolution
-check inside ``doctor``, and a broker-side ``reconcile``. Both require an
-actual TWS/Gateway connection to mean anything, which the build plan treats
-as crossing from "write and test code" into "operate a connected trading
-system" (see ``wit/nautilus/node_live.py``'s module docstring on Phase N6's
-gate) - Nautilus's own exec-engine reconciliation already runs automatically
-on every ``node.run()`` connect (``LiveExecEngineConfig(reconciliation=True)``
-in ``build_config()``). Verifying that live is Phase N9's attended gate, the
-same way N6 deferred ``node.run()`` itself rather than guess at it unverified.
+**``doctor`` DOES check Alpaca/Polygon connectivity** (broker swap addition,
+``docs/whatif-we-used-alpaca-quirky-aurora.md``'s own stated verification
+requirement) — unlike the IB build, which deferred all live-connection
+checking to Phase N9's attended gate. Both calls here are read-only
+(``get_account``, one price lookup) and cheap enough to run from a manual
+command: Alpaca's REST has no meaningful per-call rate limit for this, and
+Polygon's confirmed 5/min free-tier ceiling easily absorbs one ``doctor``
+invocation's single call. What's still deliberately NOT added here: a
+broker-side ``reconcile`` (Nautilus's own exec-engine reconciliation already
+runs automatically on every ``node.run()`` connect —
+``LiveExecEngineConfig(reconciliation=True)`` in ``build_config()``) and any
+order-submission check (verifying a live paper order end-to-end is Phase 7's
+staged validation gate, not something ``doctor`` should do unattended).
 """
 from __future__ import annotations
 
@@ -41,9 +45,70 @@ def cmd_version(_: argparse.Namespace) -> int:
     return 0
 
 
+def _check_alpaca(problems: list[str]) -> None:
+    """Read-only ``get_account`` round-trip - confirms the key pair
+    authenticates AND (independent of ``ALPACA_PAPER``) that the account
+    number itself is ``PA``-prefixed, mirroring the live check Phase 0 of the
+    broker swap ran by hand before this was wired into ``doctor``."""
+    if not (CONFIG.alpaca.api_key and CONFIG.alpaca.secret_key):
+        problems.append("ALPACA_API_KEY/ALPACA_SECRET_KEY are not both set (.env) - "
+                        "needed for the paper_only boot assertion")
+        print("Alpaca    : SKIPPED (key/secret not both set)")
+        return
+    try:
+        from alpaca.trading.client import TradingClient
+
+        client = TradingClient(
+            api_key=CONFIG.alpaca.api_key, secret_key=CONFIG.alpaca.secret_key,
+            paper=CONFIG.alpaca.paper,
+        )
+        account = client.get_account()
+        is_paper_account = str(account.account_number).startswith("PA")
+        print(f"Alpaca    : connected, account={account.account_number} "
+             f"status={account.status.value} {'PAPER' if is_paper_account else 'LIVE!!'}")
+        if not is_paper_account:
+            problems.append(
+                f"Alpaca account_number={account.account_number!r} does not start with "
+                f"'PA' - this looks like a LIVE account, refusing to treat as paper "
+                f"regardless of ALPACA_PAPER"
+            )
+    except Exception as e:  # noqa: BLE001 - a doctor check must report, never crash
+        problems.append(f"Alpaca connectivity check failed: {type(e).__name__}: {e}")
+        print(f"Alpaca    : FAILED ({type(e).__name__}: {e})")
+
+
+def _check_polygon(problems: list[str]) -> None:
+    """One read-only price lookup, used only to distinguish free (delayed,
+    403 on the real-time endpoint) from paid (real-time, 200) tier - the same
+    live signal Phase 0 of the broker swap used to confirm this account is
+    free-tier, now surfaced in ``doctor`` instead of a one-off manual check."""
+    if not CONFIG.polygon.api_key:
+        print("Polygon   : SKIPPED (POLYGON_API_KEY not set)")
+        return
+    import json
+    import urllib.error
+    import urllib.request
+
+    try:
+        url = f"https://api.polygon.io/v2/last/trade/AAPL?apiKey={CONFIG.polygon.api_key}"
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                json.loads(resp.read().decode())
+            tier = "REAL-TIME (paid tier)"
+        except urllib.error.HTTPError as e:
+            if e.code != 403:
+                raise
+            tier = f"DELAYED ~{CONFIG.polygon.delayed_minutes}min (free tier - confirmed via 403 on the real-time endpoint)"
+        print(f"Polygon   : connected, {tier}")
+    except Exception as e:  # noqa: BLE001 - a doctor check must report, never crash
+        problems.append(f"Polygon connectivity check failed: {type(e).__name__}: {e}")
+        print(f"Polygon   : FAILED ({type(e).__name__}: {e})")
+
+
 def cmd_doctor(_: argparse.Namespace) -> int:
-    """Config/env sanity plus a real LLM round-trip. IB connectivity is
-    deliberately not checked here - see this module's docstring."""
+    """Config/env sanity, a real LLM round-trip, and read-only Alpaca/Polygon
+    connectivity checks - see this module's docstring for why the latter is
+    safe to run unattended (unlike an order-submission check, which isn't)."""
     problems: list[str] = []
     if CONFIG.committee_mode not in ("llm", "rules"):
         problems.append(f"WIT_COMMITTEE_MODE={CONFIG.committee_mode!r} not recognized "
@@ -57,13 +122,12 @@ def cmd_doctor(_: argparse.Namespace) -> int:
             problems.append("NARA_API_KEY is not set (.env)")
         if not CONFIG.llm.deep_model or not CONFIG.llm.quick_model:
             problems.append("WIT_DEEP_MODEL / WIT_QUICK_MODEL are not both set (.env)")
-    if not CONFIG.ib.account_id:
-        problems.append("TWS_ACCOUNT is not set (.env) - needed for the paper_only boot assertion")
+    if not CONFIG.alpaca.paper:
+        problems.append("ALPACA_PAPER is false — this build must stay paper until Phase 7's gate passes")
     if not CONFIG.safety.paper_only:
-        problems.append("WIT_PAPER_ONLY is false — this build must stay paper until Phase N9's gate passes")
+        problems.append("WIT_PAPER_ONLY is false — this build must stay paper until Phase 7's gate passes")
 
-    print(f"IB target : {CONFIG.ib.host}:{CONFIG.ib.port} (client_id={CONFIG.ib.client_id})")
-    print(f"paper_only: {CONFIG.safety.paper_only}")
+    print(f"paper_only: {CONFIG.safety.paper_only} (alpaca.paper={CONFIG.alpaca.paper})")
     print(f"journal   : {CONFIG.journal_path}")
     print(f"kill sw   : {'ENGAGED' if Path(CONFIG.safety.kill_switch_file).exists() else 'clear'}")
     print(f"committee : {CONFIG.committee_mode}"
@@ -99,8 +163,8 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         _ping_llm("PM", CONFIG.llm.api_key, CONFIG.llm.base_url, CONFIG.llm.deep_model)
         _ping_llm("quick", CONFIG.llm.nara_api_key, CONFIG.llm.nara_base_url, CONFIG.llm.quick_model)
 
-    print("IB        : SKIPPED - live connectivity is verified attended, "
-         "Phase N9's gate (see this module's docstring)")
+    _check_alpaca(problems)
+    _check_polygon(problems)
 
     if problems:
         print("\nProblems:")
@@ -229,8 +293,8 @@ def cmd_dream(args: argparse.Namespace) -> int:
 def _run_node(args: argparse.Namespace) -> int:
     from wit.nautilus import node_live
 
-    print(f"Booting IB node: {CONFIG.ib.host}:{CONFIG.ib.port} "
-         f"account={CONFIG.ib.account_id or '(unset)'} paper_only={CONFIG.safety.paper_only}")
+    print(f"Booting node: Alpaca (execution, paper={CONFIG.alpaca.paper}) + "
+         f"Polygon (data) paper_only={CONFIG.safety.paper_only}")
     node_live.run()
     return 0
 
@@ -238,7 +302,8 @@ def _run_node(args: argparse.Namespace) -> int:
 def cmd_paper(args: argparse.Namespace) -> int:
     """Boot the live paper-trading node and block until stopped (Ctrl+C).
     See `wit/nautilus/node_live.py`'s module docstring for the manual,
-    attended gate this needs before the first real run against TWS."""
+    attended gate this needs before the first real run against Alpaca's
+    paper API."""
     return _run_node(args)
 
 

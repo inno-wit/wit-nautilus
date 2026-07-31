@@ -1,19 +1,19 @@
 """wit/nautilus/node_live.py: the paper_only boot assertion and the config/
-strategy assembly that don't need a live IB connection to test. Actually
-connecting (`node.run()`) is the build plan's Phase N6 gate and is a manual,
-watched verification step against a real TWS/Gateway session - not something
-a unit test does.
+strategy assembly that don't need a live Alpaca/Polygon connection to test.
+Actually connecting (`node.run()`) is the broker swap's Phase 7 staged
+validation gate and is a manual, watched verification step against real paper
+APIs - not something a unit test does.
 """
 from __future__ import annotations
 
 import pytest
 
 from wit.committee.stub import StubPolicyProvider
-from wit.config import Config, IBConfig, SafetyConfig
+from wit.config import AlpacaConfig, Config, SafetyConfig
 from wit.nautilus import node_live
 from wit.nautilus.actor import FundStateActor, FundStateActorConfig
 
-PAPER = IBConfig(host="127.0.0.1", port=7497, client_id=1, account_id="DUR305728")
+PAPER = AlpacaConfig(api_key="PKTESTKEY", secret_key="test-secret", paper=True)
 
 
 def _config_with_paper_only(value: bool) -> Config:
@@ -29,57 +29,25 @@ def test_paper_only_accepts_a_correctly_configured_paper_account(monkeypatch):
     node_live.assert_paper_only(PAPER)  # must not raise
 
 
-def test_paper_only_accepts_the_gateway_paper_port(monkeypatch):
+def test_paper_only_rejects_paper_flag_off(monkeypatch):
     monkeypatch.setattr(node_live, "CONFIG", _config_with_paper_only(True))
-    gateway = IBConfig(host="127.0.0.1", port=4002, client_id=1, account_id="DUR305728")
-    node_live.assert_paper_only(gateway)  # must not raise
+    live = AlpacaConfig(api_key="PKTESTKEY", secret_key="test-secret", paper=False)
+    with pytest.raises(node_live.PaperOnlyViolation, match="ALPACA_PAPER is not set"):
+        node_live.assert_paper_only(live)
 
 
-def test_paper_only_rejects_the_live_tws_port(monkeypatch):
+def test_paper_only_rejects_a_missing_api_key(monkeypatch):
     monkeypatch.setattr(node_live, "CONFIG", _config_with_paper_only(True))
-    live_port = IBConfig(host="127.0.0.1", port=7496, client_id=1, account_id="DUR305728")
-    with pytest.raises(node_live.PaperOnlyViolation, match="not a recognized paper port"):
-        node_live.assert_paper_only(live_port)
+    missing = AlpacaConfig(api_key="", secret_key="test-secret", paper=True)
+    with pytest.raises(node_live.PaperOnlyViolation, match="ALPACA_API_KEY/ALPACA_SECRET_KEY"):
+        node_live.assert_paper_only(missing)
 
 
-def test_paper_only_rejects_the_live_gateway_port(monkeypatch):
+def test_paper_only_rejects_a_missing_secret_key(monkeypatch):
     monkeypatch.setattr(node_live, "CONFIG", _config_with_paper_only(True))
-    live_port = IBConfig(host="127.0.0.1", port=4001, client_id=1, account_id="DUR305728")
-    with pytest.raises(node_live.PaperOnlyViolation, match="not a recognized paper port"):
-        node_live.assert_paper_only(live_port)
-
-
-def test_paper_only_accepts_the_dockerized_ib_gateway_paper_port(monkeypatch):
-    """Phase N8 audit finding H1: the ghcr.io/gnzsnz/ib-gateway image binds
-    its native 4002 to the container's own loopback only and republishes
-    on 0.0.0.0:4004 for other Compose containers to reach - 4004 is the
-    port `fund` actually connects to, and must be accepted."""
-    monkeypatch.setattr(node_live, "CONFIG", _config_with_paper_only(True))
-    dockerized = IBConfig(host="ib-gateway", port=4004, client_id=1, account_id="DUR305728")
-    node_live.assert_paper_only(dockerized)  # must not raise
-
-
-def test_paper_only_rejects_the_dockerized_ib_gateway_live_port(monkeypatch):
-    """4003 is 4004's live-account sibling on the same image - must stay
-    excluded exactly as deliberately as native 4001 is."""
-    monkeypatch.setattr(node_live, "CONFIG", _config_with_paper_only(True))
-    live_port = IBConfig(host="ib-gateway", port=4003, client_id=1, account_id="DUR305728")
-    with pytest.raises(node_live.PaperOnlyViolation, match="not a recognized paper port"):
-        node_live.assert_paper_only(live_port)
-
-
-def test_paper_only_rejects_a_live_account_prefix(monkeypatch):
-    monkeypatch.setattr(node_live, "CONFIG", _config_with_paper_only(True))
-    live_account = IBConfig(host="127.0.0.1", port=7497, client_id=1, account_id="U1234567")
-    with pytest.raises(node_live.PaperOnlyViolation, match="does not start with 'DU'"):
-        node_live.assert_paper_only(live_account)
-
-
-def test_paper_only_rejects_an_empty_account_id(monkeypatch):
-    monkeypatch.setattr(node_live, "CONFIG", _config_with_paper_only(True))
-    empty = IBConfig(host="127.0.0.1", port=7497, client_id=1, account_id="")
-    with pytest.raises(node_live.PaperOnlyViolation, match="does not start with 'DU'"):
-        node_live.assert_paper_only(empty)
+    missing = AlpacaConfig(api_key="PKTESTKEY", secret_key="", paper=True)
+    with pytest.raises(node_live.PaperOnlyViolation, match="ALPACA_API_KEY/ALPACA_SECRET_KEY"):
+        node_live.assert_paper_only(missing)
 
 
 def test_paper_only_rejects_when_the_safety_flag_itself_is_off(monkeypatch):
@@ -89,8 +57,8 @@ def test_paper_only_rejects_when_the_safety_flag_itself_is_off(monkeypatch):
 
 
 def test_paper_only_checks_the_safety_flag_before_anything_else(monkeypatch):
-    """Even a well-formed paper account/port must not pass if the hard lock
-    itself is off - the flag is checked first, independent of what else is
+    """Even a well-formed paper config must not pass if the hard lock itself
+    is off - the flag is checked first, independent of what else is
     configured correctly."""
     monkeypatch.setattr(node_live, "CONFIG", _config_with_paper_only(False))
     with pytest.raises(node_live.PaperOnlyViolation, match="WIT_PAPER_ONLY"):
@@ -99,10 +67,10 @@ def test_paper_only_checks_the_safety_flag_before_anything_else(monkeypatch):
 
 # ── build_config ─────────────────────────────────────────────────────────
 
-def test_build_config_registers_exactly_one_ib_data_and_exec_client():
+def test_build_config_registers_exactly_one_polygon_data_and_alpaca_exec_client():
     config = node_live.build_config(PAPER)
-    assert set(config.data_clients.keys()) == {"IB"}
-    assert set(config.exec_clients.keys()) == {"IB"}
+    assert set(config.data_clients.keys()) == {"POLYGON"}
+    assert set(config.exec_clients.keys()) == {"ALPACA"}
 
 
 def test_build_config_starts_with_no_strategies_or_actors():
@@ -114,45 +82,50 @@ def test_build_config_starts_with_no_strategies_or_actors():
     assert config.actors == []
 
 
-def test_build_config_uses_the_configured_host_port_and_client_id():
+def test_build_config_uses_the_configured_alpaca_credentials():
     config = node_live.build_config(PAPER)
-    data_cfg = config.data_clients["IB"]
-    exec_cfg = config.exec_clients["IB"]
-    assert data_cfg.ibg_host == PAPER.host == exec_cfg.ibg_host
-    assert data_cfg.ibg_port == PAPER.port == exec_cfg.ibg_port
-    assert data_cfg.ibg_client_id == PAPER.client_id == exec_cfg.ibg_client_id
-    assert exec_cfg.account_id == PAPER.account_id
+    exec_cfg = config.exec_clients["ALPACA"]
+    data_cfg = config.data_clients["POLYGON"]
+    assert exec_cfg.api_key == PAPER.api_key
+    assert exec_cfg.secret_key == PAPER.secret_key
+    assert exec_cfg.paper is True
+    assert data_cfg.alpaca_api_key == PAPER.api_key
+    assert data_cfg.alpaca_secret_key == PAPER.secret_key
+    assert data_cfg.alpaca_paper is True
 
 
 def test_build_config_instrument_provider_loads_exactly_the_watchlist_ids():
     config = node_live.build_config(PAPER)
-    loaded = set(config.data_clients["IB"].instrument_provider.load_ids)
+    loaded = {str(i) for i in config.exec_clients["ALPACA"].instrument_provider.load_ids}
     expected = {pair[0] for pair in node_live.INSTRUMENT_IDS.values()}
     assert loaded == expected
 
 
-def test_build_config_rejects_a_live_ib_config():
-    """Phase N6 audit finding F9: build_config is public and previously
-    asserted nothing itself, relying entirely on callers (only build_node()
-    in this repo today) to have checked first."""
-    live = IBConfig(host="127.0.0.1", port=7496, client_id=1, account_id="U1234567")
+def test_build_config_rejects_a_live_alpaca_config():
+    """Phase N6 audit finding F9 (unchanged by the broker swap): build_config
+    is public and asserts nothing itself unless it does this - relying
+    entirely on callers (only build_node() in this repo today) to have
+    checked first would be fragile."""
+    live = AlpacaConfig(api_key="PKTESTKEY", secret_key="test-secret", paper=False)
     with pytest.raises(node_live.PaperOnlyViolation):
         node_live.build_config(live)
 
 
-def test_build_config_sets_an_explicit_market_data_type():
-    """Phase N6 audit finding F6: the adapter default (REALTIME) was being
-    left implicit despite Phase N0's confirmed finding that this account has
-    no US equity market-data entitlement."""
+def test_build_config_routes_polygon_to_the_alpaca_venue():
+    """The broker swap's load-bearing design decision (verified in Phase 0
+    against installed nautilus_trader's data/engine.pyx register_venue_routing):
+    Polygon's data client must be routed to serve ALPACA-addressed data
+    commands even though its own client venue is None."""
     config = node_live.build_config(PAPER)
-    assert config.data_clients["IB"].market_data_type is not None
+    routing = config.data_clients["POLYGON"].routing
+    assert routing.venues == frozenset({"ALPACA"})
 
 
 # ── build_strategies ─────────────────────────────────────────────────────
 
 def _fund_state():
     return FundStateActor(FundStateActorConfig(
-        venue=node_live.IB_VENUE, kill_switch_file="unused_in_this_test",
+        venue=node_live.ALPACA_VENUE, kill_switch_file="unused_in_this_test",
         dream_state_path="unused_in_this_test",
     ))
 
@@ -163,50 +136,45 @@ def test_build_strategies_produces_one_per_mapped_watchlist_symbol():
     assert symbols == set(node_live.INSTRUMENT_IDS.keys())
 
 
-def test_build_strategies_maps_instrument_ids_correctly():
-    """Phase N6 audit finding F2: NVDA.SMART etc. don't resolve against IB -
-    SMART is the routing destination, not a valid primary exchange, and
-    reqContractDetails returns error 200 for all seven equities under that
-    form. Re-probed live: all seven resolve unambiguously under .NASDAQ."""
+def test_build_strategies_maps_instrument_ids_to_the_alpaca_venue():
     strategies = node_live.build_strategies(StubPolicyProvider(), _fund_state())
     by_symbol = {s.config.symbol: s for s in strategies}
-    assert str(by_symbol["EURUSD"].config.instrument_id) == "EUR/USD.IDEALPRO"
-    assert str(by_symbol["NVDA"].config.instrument_id) == "NVDA.NASDAQ"
+    assert str(by_symbol["NVDA"].config.instrument_id) == "NVDA.ALPACA"
+    assert str(by_symbol["AAPL"].config.instrument_id) == "AAPL.ALPACA"
 
 
 def test_build_strategies_bar_type_instrument_matches_the_strategys_own_instrument():
-    """Phase N6 audit finding F1: the bar-type f-string used to duplicate the
-    step token (f"{ib_id}-1-{_bar_step(...)}-..." where _bar_step already
-    returns "1-HOUR"), producing a bar type whose instrument_id parsed as
-    e.g. "NVDA.NASDAQ-1" - a phantom instrument request_bars can't find, so
-    the warmup callback never fires and the strategy never subscribes to
-    live data. The prior test only checked "1-HOUR" was a substring, which a
-    malformed "NVDA.NASDAQ-1-HOUR-..." also satisfies - this checks the
-    actual parsed instrument identity instead."""
     strategies = node_live.build_strategies(StubPolicyProvider(), _fund_state())
     for s in strategies:
         assert s.config.bar_type.instrument_id == s.config.instrument_id
         assert "1-HOUR" in str(s.config.bar_type)
 
 
-def test_build_strategies_uses_mid_price_for_fx_and_last_for_equities():
-    """Phase N6 audit finding F5: IB has no trade prints for CASH (FX)
-    contracts, so a LAST/"TRADES" bar request for EURUSD is rejected -
-    it needs MID."""
-    strategies = node_live.build_strategies(StubPolicyProvider(), _fund_state())
-    by_symbol = {s.config.symbol: s for s in strategies}
-    assert "-MID-" in str(by_symbol["EURUSD"].config.bar_type)
-    assert "-LAST-" in str(by_symbol["NVDA"].config.bar_type)
-
-
-def test_build_strategies_sets_the_ib_account_venue():
-    """Phase N6 audit finding F4: without this, WitStrategy looks the
-    account up under the instrument's own exchange-routing venue, which is
-    never where a multi-venue broker's account is indexed - every decision
-    would die at "no_account_snapshot" before build_plan is ever reached."""
+def test_build_strategies_uses_last_price_for_every_equity():
+    """Every watchlist symbol is a US equity now (EURUSD dropped - Alpaca has
+    no forex), so every bar type uses LAST, not the IB build's per-asset-class
+    MID/LAST split."""
     strategies = node_live.build_strategies(StubPolicyProvider(), _fund_state())
     for s in strategies:
-        assert s.config.account_venue == node_live.IB_VENUE
+        assert "-LAST-" in str(s.config.bar_type)
+
+
+def test_build_strategies_leaves_account_venue_unset():
+    """Unlike the IB build (which needed an explicit IB_VENUE override -
+    Phase N6 audit finding F4), the broker swap's single-venue design means
+    instrument_id.venue already IS ALPACA_VENUE, so WitStrategyConfig's own
+    default (None -> resolved to instrument_id.venue) is correct without an
+    override. See node_live.py's module docstring."""
+    strategies = node_live.build_strategies(StubPolicyProvider(), _fund_state())
+    for s in strategies:
+        assert s.config.account_venue is None
+
+
+def test_build_strategies_watchlist_has_no_forex():
+    """EURUSD dropped - Alpaca has no forex (build plan's "Architecture"
+    section)."""
+    strategies = node_live.build_strategies(StubPolicyProvider(), _fund_state())
+    assert "EURUSD" not in {s.config.symbol for s in strategies}
 
 
 # ── _bar_step ────────────────────────────────────────────────────────────
@@ -221,14 +189,13 @@ def test_bar_step_rejects_an_unknown_timeframe():
         node_live._bar_step("W1")
 
 
-# ── IB_VENUE ─────────────────────────────────────────────────────────────
+# ── ALPACA_VENUE ─────────────────────────────────────────────────────────
 
-def test_fund_state_is_configured_against_the_ib_account_venue_not_an_exchange():
-    """Phase N6 design note: the account lives under IB_VENUE
-    ("INTERACTIVE_BROKERS"), not under an instrument-routing venue like
-    SMART or IDEALPRO - a fund trading both FX and equities still has one
-    account/one equity figure."""
-    assert str(node_live.IB_VENUE) == "INTERACTIVE_BROKERS"
+def test_fund_state_is_configured_against_the_single_alpaca_venue():
+    """The broker swap's design note: every InstrumentId - including the ones
+    whose bars come from Polygon - uses ALPACA_VENUE (node_live.py's module
+    docstring)."""
+    assert str(node_live.ALPACA_VENUE) == "ALPACA"
 
 
 # ── watched_bar_types / bar_interval_seconds (Phase N8 staleness watchdog) ─
@@ -239,13 +206,10 @@ def test_watched_bar_types_covers_the_whole_watchlist():
 
 
 def test_watched_bar_types_matches_build_strategies_own_bar_types():
-    """Phase N6 audit finding F1 was exactly two slightly-different copies
-    of this string-building logic drifting apart - pin that the shared
+    """Phase N6 audit finding F1 (IB build) was exactly two slightly-different
+    copies of this string-building logic drifting apart - pin that the shared
     helper produces the identical strings build_strategies() actually
-    subscribes to, not just similarly-shaped ones. Keyed by symbol (Phase
-    N8 audit finding C1): the watchdog needs the logical watchlist symbol,
-    not just the bar-type string, to ask market_hours whether that
-    symbol's market is open."""
+    subscribes to, not just similarly-shaped ones."""
     strategies = node_live.build_strategies(StubPolicyProvider(), _fund_state())
     from_strategies = {s.config.symbol: str(s.config.bar_type) for s in strategies}
     assert node_live.watched_bar_types() == from_strategies

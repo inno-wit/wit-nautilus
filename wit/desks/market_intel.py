@@ -1,15 +1,24 @@
 """Market intelligence desk — real fundamentals and news, not just price action.
 
 Sources, in order of how much they can tell us:
-  - yfinance   (always on, no key): sector/PE/market-cap for equities, plus
+  - yfinance      (always on, no key): sector/PE/market-cap for equities, plus
     real news headlines for every instrument class — FX, metals and indices
     all have Yahoo Finance news feeds (DXY/rates commentary, gold, S&P).
-  - Finnhub    (optional, needs FINNHUB_API_KEY): company news + analyst
+  - Finnhub       (optional, needs FINNHUB_API_KEY): company news + analyst
     recommendation trends, equities only. Skipped silently without a key.
+  - Alpha Vantage (optional, needs ALPHAVANTAGE_API_KEY): fundamentals-only
+    fallback for whichever of sector/industry/pe_ratio/market_cap yfinance
+    didn't return, equities only. Slots into this exact optional/never-raises/
+    cached pattern like Finnhub does — the only difference is a hard daily-call
+    budget (``AlphaVantageConfig.max_calls_per_day``, default 25 = the free
+    tier's actual documented ceiling, confirmed against the broker swap's own
+    Alpha Vantage entitlement note): unlike Finnhub, this API has no headroom
+    to spend carelessly across a multi-symbol watchlist, so a day-scoped
+    counter refuses calls past the budget rather than risking a 429 mid-cycle.
 
-This desk is enrichment, not a hard input — a Yahoo/Finnhub outage must not
-stall the cycle, so ``compute`` never raises; a failure just yields an empty
-block the committee prompt quietly omits.
+This desk is enrichment, not a hard input — a Yahoo/Finnhub/Alpha Vantage
+outage must not stall the cycle, so ``compute`` never raises; a failure just
+yields an empty block the committee prompt quietly omits.
 
 Ported verbatim from ``Wit-Hedge-fund/engine/signals/market_intel.py`` (Phase N2).
 """
@@ -25,7 +34,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, timedelta
 from typing import Any
 
-from wit.config import CONFIG, IntelConfig
+from wit.config import CONFIG, AlphaVantageConfig, IntelConfig
 
 # MT5-era symbol -> Yahoo Finance ticker, for the instrument classes that need
 # translating. Anything not listed here is assumed to be a straight-through
@@ -157,14 +166,78 @@ def _finnhub_fetch(symbol: str, api_key: str) -> dict[str, Any]:
     return out
 
 
+# ── Alpha Vantage (optional, fundamentals-only fallback, hard daily budget) ──
+
+class _DailyCallBudget:
+    """A day-scoped call counter, not a rolling window — Alpha Vantage's free
+    tier resets at UTC midnight, and a simple per-day count is what
+    ``AlphaVantageConfig.max_calls_per_day`` is actually meant to cap (unlike
+    Polygon's rolling-minute limit in ``wit/adapters/polygon/data.py``, which
+    is a different kind of ceiling on a different provider)."""
+
+    def __init__(self) -> None:
+        self._day: date = date.today()  # noqa: DTZ011 - day-granularity budget, tz doesn't matter here
+        self._used = 0
+
+    def try_consume(self, max_calls: int) -> bool:
+        today = date.today()  # noqa: DTZ011 - day-granularity budget, tz doesn't matter here
+        if today != self._day:
+            self._day, self._used = today, 0
+        if self._used >= max_calls:
+            return False
+        self._used += 1
+        return True
+
+
+_av_budget = _DailyCallBudget()
+
+
+def _alphavantage_get(function: str, api_key: str, **params: str) -> Any:
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    url = f"https://www.alphavantage.co/query?function={function}&{query}&apikey={api_key}"
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        return json.loads(resp.read().decode())
+
+
+_ALPHAVANTAGE_ERRORS = (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError,
+                        KeyError, ValueError, TypeError)
+
+
+def _alphavantage_fetch(symbol: str, api_key: str) -> dict[str, Any]:
+    """Fundamentals only (the ``OVERVIEW`` endpoint) — mirrors ``_finnhub_fetch``'s
+    never-raises-past-this-function shape, but has exactly one endpoint to call
+    (no per-endpoint try/except needed) since the daily budget makes spending a
+    second call per symbol on headlines/analyst data (which yfinance/Finnhub
+    already cover) not worth it."""
+    out: dict[str, Any] = {}
+    try:
+        overview = _alphavantage_get("OVERVIEW", api_key, symbol=symbol)
+        if overview.get("Sector"):
+            out["sector"] = overview["Sector"]
+        if overview.get("Industry"):
+            out["industry"] = overview["Industry"]
+        pe = overview.get("PERatio")
+        if pe not in (None, "None", "-"):
+            out["pe_ratio"] = float(pe)
+        cap = overview.get("MarketCapitalization")
+        if cap not in (None, "None", "-"):
+            out["market_cap"] = float(cap)
+    except _ALPHAVANTAGE_ERRORS as e:
+        out["_errors"] = [f"overview: {type(e).__name__}: {e}"]
+    return out
+
+
 # ── Cache (a live cycle re-reads the same symbol at most once per TTL) ────
 
 _cache: dict[str, tuple[float, MarketIntel]] = {}
 
 
-def compute(symbol: str, cfg: IntelConfig | None = None) -> MarketIntel:
+def compute(
+    symbol: str, cfg: IntelConfig | None = None, av_cfg: AlphaVantageConfig | None = None,
+) -> MarketIntel:
     """Fetch fundamentals + news for ``symbol``. Never raises."""
     cfg = cfg or CONFIG.intel
+    av_cfg = av_cfg or CONFIG.alphavantage
     now = time.monotonic()
     cached = _cache.get(symbol)
     if cached and now - cached[0] < cfg.cache_ttl_seconds:
@@ -196,6 +269,29 @@ def compute(symbol: str, cfg: IntelConfig | None = None) -> MarketIntel:
         seen: set[str] = set()
         data["headlines"] = [h for h in merged if not (h in seen or seen.add(h))]
         data.update(fh)
+
+    # Alpha Vantage: fundamentals-only fallback for whatever yfinance/Finnhub
+    # left empty (never overwrites a value they already found) - budget-checked
+    # BEFORE the call, not after, so a symbol that's already fully covered
+    # never spends from the 25/day ceiling at all.
+    missing_fundamentals = is_equity and any(
+        data.get(key) is None for key in ("sector", "industry", "pe_ratio", "market_cap")
+    )
+    if missing_fundamentals and av_cfg.api_key and _av_budget.try_consume(av_cfg.max_calls_per_day):
+        try:
+            av = _alphavantage_fetch(symbol, av_cfg.api_key)
+        except Exception as e:  # noqa: BLE001 - belt-and-braces on top of
+                                 # _alphavantage_fetch's own try/except
+            av, e_note = {}, f"alphavantage: {type(e).__name__}: {e}"
+            error = (error + "; " if error else "") + e_note
+        else:
+            av_errors = av.pop("_errors", None)
+            if av_errors:
+                note = "alphavantage: " + "; ".join(av_errors)
+                error = (error + "; " if error else "") + note
+        for key in ("sector", "industry", "pe_ratio", "market_cap"):
+            if data.get(key) is None and av.get(key) is not None:
+                data[key] = av[key]
 
     intel = MarketIntel(
         symbol=symbol, is_equity=is_equity,

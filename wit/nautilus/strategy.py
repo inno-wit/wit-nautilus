@@ -81,12 +81,13 @@ class WitStrategyConfig(StrategyConfig, frozen=True):
     # The venue the ACCOUNT is registered under - not necessarily the same as
     # instrument_id.venue. Defaults to None, resolved at lookup time to
     # instrument_id.venue (Phase N5 backtest's single-venue setup, unchanged).
-    # A multi-venue broker like IB registers the account under its own fixed
-    # pseudo-venue (see wit/nautilus/node_live.py's IB_VENUE), separate from
-    # any instrument's SMART/NASDAQ/IDEALPRO routing venue - passing that
-    # through here is what Phase N6 audit finding F4 requires: without it,
-    # every decision dies at "no_account_snapshot" because the account is
-    # never found under an exchange-routing venue.
+    # Exists for a multi-venue broker that registers its account under its own
+    # fixed pseudo-venue, separate from any instrument's own routing venue
+    # (Phase N6 audit finding F4, from the original Interactive Brokers build) -
+    # the current Alpaca/Polygon build doesn't need this override
+    # (wit/nautilus/node_live.py's ALPACA_VENUE already IS every instrument's
+    # own venue), but the field stays generic rather than assuming every future
+    # broker will be single-venue too.
     account_venue: Venue | None = None
 
 

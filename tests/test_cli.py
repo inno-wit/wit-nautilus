@@ -130,13 +130,20 @@ def test_review_scores_a_completed_round_trip_from_the_journal_alone(tmp_path, m
 
 
 # ── doctor ───────────────────────────────────────────────────────────────
+#
+# Every test here passes empty AlpacaConfig/PolygonConfig explicitly (not just
+# relying on Config()'s defaults, which read real .env-sourced keys via
+# AlpacaConfig/PolygonConfig's own field defaults) - doctor now makes real
+# read-only network calls when keys ARE present (this module's docstring),
+# and a unit test must never depend on live credentials or network access.
 
 def test_doctor_reports_missing_env_as_problems(tmp_path, monkeypatch, capsys):
-    from wit.config import Config, IBConfig, LLMConfig, SafetyConfig
+    from wit.config import AlpacaConfig, Config, LLMConfig, PolygonConfig, SafetyConfig
     cfg = Config(
         safety=SafetyConfig(kill_switch_file=str(tmp_path / "KILL"), paper_only=True),
         llm=LLMConfig(api_key="", deep_model="", quick_model=""),
-        ib=IBConfig(account_id=""),
+        alpaca=AlpacaConfig(api_key="", secret_key=""),
+        polygon=PolygonConfig(api_key=""),
     )
     monkeypatch.setattr(cli, "CONFIG", cfg)
 
@@ -144,16 +151,18 @@ def test_doctor_reports_missing_env_as_problems(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "ANTHROPIC_API_KEY" in out
-    assert "TWS_ACCOUNT" in out
-    assert "IB        : SKIPPED" in out
+    assert "ALPACA_API_KEY/ALPACA_SECRET_KEY" in out
+    assert "Alpaca    : SKIPPED" in out
+    assert "Polygon   : SKIPPED" in out
 
 
 def test_doctor_flags_paper_only_false(tmp_path, monkeypatch, capsys):
-    from wit.config import Config, IBConfig, LLMConfig, SafetyConfig
+    from wit.config import AlpacaConfig, Config, LLMConfig, PolygonConfig, SafetyConfig
     cfg = Config(
         safety=SafetyConfig(kill_switch_file=str(tmp_path / "KILL"), paper_only=False),
         llm=LLMConfig(api_key="", deep_model="", quick_model=""),
-        ib=IBConfig(account_id="DUR1"),
+        alpaca=AlpacaConfig(api_key="PKTEST", secret_key="test", paper=True),
+        polygon=PolygonConfig(api_key=""),
     )
     monkeypatch.setattr(cli, "CONFIG", cfg)
     rc = cli.cmd_doctor(cli.build_parser().parse_args(["doctor"]))
@@ -161,18 +170,38 @@ def test_doctor_flags_paper_only_false(tmp_path, monkeypatch, capsys):
     assert "WIT_PAPER_ONLY is false" in capsys.readouterr().out
 
 
-def test_doctor_reports_ib_as_skipped_not_attempted(tmp_path, monkeypatch, capsys):
-    """Regression guard for this module's own documented scope limit -
-    doctor reports IB connectivity as deliberately skipped, not attempted."""
-    from wit.config import Config, IBConfig, LLMConfig, SafetyConfig
+def test_doctor_flags_alpaca_paper_false(tmp_path, monkeypatch, capsys):
+    from wit.config import AlpacaConfig, Config, LLMConfig, PolygonConfig, SafetyConfig
     cfg = Config(
         safety=SafetyConfig(kill_switch_file=str(tmp_path / "KILL"), paper_only=True),
         llm=LLMConfig(api_key="", deep_model="", quick_model=""),
-        ib=IBConfig(account_id="DUR1"),
+        alpaca=AlpacaConfig(api_key="", secret_key="", paper=False),
+        polygon=PolygonConfig(api_key=""),
+    )
+    monkeypatch.setattr(cli, "CONFIG", cfg)
+    rc = cli.cmd_doctor(cli.build_parser().parse_args(["doctor"]))
+    assert rc == 1
+    assert "ALPACA_PAPER is false" in capsys.readouterr().out
+
+
+def test_doctor_reports_alpaca_and_polygon_as_skipped_not_attempted_without_keys(
+    tmp_path, monkeypatch, capsys,
+):
+    """Regression guard for this module's own documented scope limit -
+    doctor reports Alpaca/Polygon connectivity as skipped (not attempted, no
+    network call) when no key is configured."""
+    from wit.config import AlpacaConfig, Config, LLMConfig, PolygonConfig, SafetyConfig
+    cfg = Config(
+        safety=SafetyConfig(kill_switch_file=str(tmp_path / "KILL"), paper_only=True),
+        llm=LLMConfig(api_key="", deep_model="", quick_model=""),
+        alpaca=AlpacaConfig(api_key="", secret_key=""),
+        polygon=PolygonConfig(api_key=""),
     )
     monkeypatch.setattr(cli, "CONFIG", cfg)
     cli.cmd_doctor(cli.build_parser().parse_args(["doctor"]))
-    assert "IB        : SKIPPED" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Alpaca    : SKIPPED" in out
+    assert "Polygon   : SKIPPED" in out
 
 
 # ── live requires --i-know ──────────────────────────────────────────────

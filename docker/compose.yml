@@ -1,55 +1,25 @@
-# Phase N8. Two services on one private bridge network: ib-gateway (the broker
-# connection) and fund (this repo, running `wit paper`). Neither publishes an API port to
-# the host - fund reaches ib-gateway by its Compose service name on the internal network
-# only. The one published port is VNC, loopback-bound, for one-time paper-account
-# login/2FA over an SSH tunnel (`ssh -L 5900:127.0.0.1:5900 user@vps`, then point a VNC
-# client at localhost:5900) - never expose it beyond 127.0.0.1.
+# Broker swap (docs/whatif-we-used-alpaca-quirky-aurora.md): the Phase N8
+# ib-gateway service is gone entirely. Alpaca (execution) and Polygon (data)
+# are both pure outbound HTTPS/WSS to third-party clouds - no local gateway
+# container, no inbound-facing port, no VNC/2FA login step. `fund` is the only
+# service now; it needs no `depends_on` and no `networks:` (nothing else on
+# this host for it to reach).
 #
 # Bring up: docker compose -f docker/compose.yml up -d
 # Logs:     docker compose -f docker/compose.yml logs -f fund
 # Stop:     docker compose -f docker/compose.yml down          (data/ is a bind mount, survives)
 #
-# Before first `up`: populate ../.env from ../.env.example, and docker/ib-gateway.env from
-# docker/ib-gateway.env.example (Phase N8 audit finding L2 - the two are deliberately
-# separate: ib-gateway is a third-party image on a floating tag with no legitimate use for
-# wit's own secrets, and vice versa). Match FUND_UID (below) to your deploy user's real
-# uid - `id -u` - or the fund container won't be able to write data/ (Phase N8 audit
-# finding M2; vps-setup.sh deliberately doesn't create the deploy user, so its uid isn't
+# Before first `up`: populate ../.env from ../.env.example with real
+# ALPACA_API_KEY/ALPACA_SECRET_KEY/POLYGON_API_KEY (and ALPHAVANTAGE_API_KEY if
+# enrichment is wanted) - there is no second gitignored env file to worry
+# about, unlike the old ib-gateway.env split (Phase N8 audit finding L2 doesn't
+# apply here: Alpaca/Polygon secrets are wit's own, not a third-party image's).
+# Match FUND_UID (below) to your deploy user's real uid - `id -u` - or the fund
+# container won't be able to write data/ (Phase N8 audit finding M2;
+# vps-setup.sh deliberately doesn't create the deploy user, so its uid isn't
 # knowable ahead of time here).
 
 services:
-  ib-gateway:
-    # :stable floats. Pin by digest before any real deployment - after the first
-    # `docker compose pull`, run:
-    #   docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/gnzsnz/ib-gateway:stable
-    # and replace the line below with `image: ghcr.io/gnzsnz/ib-gateway@sha256:<digest>`.
-    # A floating tag on a container that logs into a real (paper) brokerage account is
-    # exactly the kind of surprise-upgrade risk digest pinning exists to close.
-    image: ghcr.io/gnzsnz/ib-gateway:stable
-    # TWS_USERID/TWS_PASSWORD/VNC_SERVER_PASSWORD only - see ib-gateway.env.example.
-    env_file: ib-gateway.env
-    environment:
-      TRADING_MODE: paper
-      TIME_ZONE: UTC
-      TWOFA_TIMEOUT_ACTION: restart
-      READ_ONLY_API: "no"
-    ports:
-      - "127.0.0.1:5900:5900"   # VNC - loopback only, reach over an SSH tunnel
-    networks: [internal]
-    restart: unless-stopped
-    healthcheck:
-      # The image ships no healthcheck of its own (confirmed against its README) - probe
-      # the paper port other containers actually reach it on. NOT 127.0.0.1:4002 (a
-      # healthcheck that only proves the gateway's OWN loopback listener is up would have
-      # gone green while `fund` still couldn't connect - see the IBG_PORT comment below;
-      # this probes the exact path `fund` uses, so service_healthy means what it claims).
-      # bash's /dev/tcp avoids depending on curl/nc being present in this image.
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/4004' || exit 1"]
-      interval: 30s
-      timeout: 10s
-      start_period: 120s   # IBC + TWS cold start is slow, especially on first run
-      retries: 5
-
   fund:
     build:
       context: ..
@@ -62,26 +32,9 @@ services:
         # than no mechanism, since it looks like it's there. vps-setup.sh prints the
         # deploy user's uid as part of its own closing instructions.
         FUND_UID: "${FUND_UID:-1000}"
-    depends_on:
-      ib-gateway:
-        condition: service_healthy
     env_file: ../.env
-    environment:
-      # Override .env.example's local-TWS-on-Windows defaults (127.0.0.1:7497) - inside
-      # Compose, ib-gateway is reached by its service name. Port 4004, NOT 4002 (Phase N8
-      # audit finding H1): the image binds its native paper port (4002) to the
-      # container's OWN loopback only and republishes it via socat on 0.0.0.0:4004 for
-      # other containers on the bridge network to reach - 4002 is never reachable from
-      # here. node_live.py's PAPER_PORTS accepts 4004 for exactly this reason.
-      IBG_HOST: ib-gateway
-      IBG_PORT: "4004"
     volumes:
       - ../data:/app/data   # journal, dream state, kill switch - the one stateful volume
                             # that matters; back it up nightly (see backup-data.sh)
-    networks: [internal]
     restart: unless-stopped
     command: ["paper"]
-
-networks:
-  internal:
-    driver: bridge

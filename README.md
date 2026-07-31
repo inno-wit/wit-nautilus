@@ -1,7 +1,10 @@
 # wit-nautilus
 
 Wit Hedge Fund's LLM committee + deterministic risk pipeline, ported onto
-[NautilusTrader](https://nautilustrader.io/) over Interactive Brokers. A second,
+[NautilusTrader](https://nautilustrader.io/) over Alpaca (execution, paper) +
+Polygon (bar data) — originally built over Interactive Brokers, swapped after
+IB's paper account turned out to have no US-equity market-data entitlement
+(see `docs/whatif-we-used-alpaca-quirky-aurora.md`). A second,
 Linux-native build alongside the original MT5 build
 ([`Wit-Hedge-fund`](https://github.com/inno-wit/Wit-Hedge-fund)), which keeps running
 unchanged on its own Windows VPS.
@@ -31,8 +34,8 @@ adapter, the per-symbol scheduling loop, and where each safety guarantee (kill s
 
 ```bash
 python -m venv .venv
-.venv/Scripts/python -m pip install -e ".[dev]"     # or ".[ib]" once Phase N3/N6 land
-cp .env.example .env      # fill in ANTHROPIC_API_KEY + IB paper account details
+.venv/Scripts/python -m pip install -e ".[dev]"     # or ".[alpaca,polygon]" for the live/paper node
+cp .env.example .env      # fill in ANTHROPIC_API_KEY + Alpaca/Polygon paper account details
 pytest -q
 ```
 
