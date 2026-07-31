@@ -81,12 +81,29 @@ class _RateLimiter:
 
 _PolygonError = (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, KeyError)
 
+# Bounds the one-time warmup fetch's page count per symbol - Polygon's aggs
+# endpoint paginates (see _fetch_aggs's docstring), and unboundedly following
+# next_url until request.limit (750) is satisfied would cost far more of the
+# shared rate budget than warming up 7 symbols can afford at boot. 3 pages
+# lands around 270-330 bars per symbol in practice (each page ≈90-110 bars on
+# this account) - comfortably clears the strategy's 101-bar floor with margin
+# without turning startup into a 15+ minute pagination crawl.
+_MAX_WARMUP_PAGES = 3
 
-def _polygon_get(path: str, api_key: str, **params: str) -> dict:
-    query = "&".join(f"{k}={v}" for k, v in params.items())
-    url = f"https://api.polygon.io{path}?{query}&apiKey={api_key}"
+
+def _polygon_get(url: str) -> dict:
     with urllib.request.urlopen(url, timeout=15) as resp:
         return json.loads(resp.read().decode())
+
+
+def _polygon_aggs_url(
+    symbol: str, multiplier: int, timespan: str, start_ms: int, end_ms: int,
+    api_key: str, limit: int,
+) -> str:
+    return (
+        f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}"
+        f"/{start_ms}/{end_ms}?adjusted=true&sort=asc&limit={limit}&apiKey={api_key}"
+    )
 
 
 def _bar_seconds(bar_type: BarType) -> int:
@@ -192,42 +209,62 @@ class PolygonDataClient(LiveMarketDataClient):
 
     async def _fetch_aggs(
         self, symbol: str, multiplier: int, timespan: str,
-        start_ms: int, end_ms: int, limit: int = 5000,
+        start_ms: int, end_ms: int, limit: int = 5000, max_pages: int = 1,
     ) -> list[dict]:
-        await self._limiter.acquire()
-        try:
-            data = await asyncio.to_thread(
-                _polygon_get,
-                f"/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{start_ms}/{end_ms}",
-                self._api_key,
-                adjusted="true", sort="asc", limit=str(limit),
-            )
-        except urllib.error.HTTPError as e:
-            # Read the response body before it's gone (audit finding M1):
-            # Polygon's error JSON distinguishes NOT_AUTHORIZED (entitlement)
-            # from the rate-limit message, and the request shape (multiplier/
-            # timespan/window) is what actually identifies which poller failed
-            # - both were being discarded, which is why a systematic per-call-
-            # shape failure (see B2) read as an unexplained trickle instead.
+        """Follows Polygon's ``next_url`` cursor for up to ``max_pages`` pages.
+
+        This is the actual root cause of audit finding B1 (6/7 symbols warmed
+        up below the strategy's 101-bar floor): a prior fix attempt widened
+        the requested date range on the theory that equities' ~6.5h/24h
+        trading calendar was starving a calendar-time lookback window, but a
+        live redeploy showed delivered counts stayed flat (83-110 bars)
+        regardless of asking 9-27x further back - proving it wasn't a
+        date-range depth problem. A clean local request against this account
+        confirmed the real cause instead: Polygon's aggs endpoint paginates
+        (``resultsCount`` far short of a 90-day window's true bar count, with
+        a populated ``next_url`` in the response) and nothing here was
+        following it, so every call silently returned only its first page no
+        matter how wide the requested range was. Live polling (``_poll_bars``/
+        ``_poll_quotes_standalone``) only ever wants the newest few bars, so
+        it stays at the default ``max_pages=1``; only the one-time warmup
+        fetch (``_request_bars``) pages further."""
+        url = _polygon_aggs_url(symbol, multiplier, timespan, start_ms, end_ms, self._api_key, limit)
+        results: list[dict] = []
+        for _ in range(max_pages):
+            await self._limiter.acquire()
             try:
-                body = e.read().decode(errors="replace")[:300]
-            except Exception:  # noqa: BLE001 - body read is best-effort diagnostics
-                body = "<no body>"
-            self._log.error(
-                f"Polygon aggs request failed for {symbol} {multiplier}/{timespan} "
-                f"[{start_ms}, {end_ms}]: HTTP {e.code}: {body}"
-            )
-            return []
-        except _PolygonError as e:
-            self._log.error(
-                f"Polygon aggs request failed for {symbol} {multiplier}/{timespan} "
-                f"[{start_ms}, {end_ms}]: {type(e).__name__}: {e}"
-            )
-            return []
-        if data.get("status") not in ("OK", "DELAYED"):
-            self._log.error(f"Polygon aggs error for {symbol} {multiplier}/{timespan}: {data}")
-            return []
-        return data.get("results", []) or []
+                data = await asyncio.to_thread(_polygon_get, url)
+            except urllib.error.HTTPError as e:
+                # Read the response body before it's gone (audit finding M1):
+                # Polygon's error JSON distinguishes NOT_AUTHORIZED (entitlement)
+                # from the rate-limit message, and the request shape (multiplier/
+                # timespan/window) is what actually identifies which poller failed
+                # - both were being discarded, which is why a systematic per-call-
+                # shape failure (see B2) read as an unexplained trickle instead.
+                try:
+                    body = e.read().decode(errors="replace")[:300]
+                except Exception:  # noqa: BLE001 - body read is best-effort diagnostics
+                    body = "<no body>"
+                self._log.error(
+                    f"Polygon aggs request failed for {symbol} {multiplier}/{timespan} "
+                    f"[{start_ms}, {end_ms}]: HTTP {e.code}: {body}"
+                )
+                break
+            except _PolygonError as e:
+                self._log.error(
+                    f"Polygon aggs request failed for {symbol} {multiplier}/{timespan} "
+                    f"[{start_ms}, {end_ms}]: {type(e).__name__}: {e}"
+                )
+                break
+            if data.get("status") not in ("OK", "DELAYED"):
+                self._log.error(f"Polygon aggs error for {symbol} {multiplier}/{timespan}: {data}")
+                break
+            results.extend(data.get("results", []) or [])
+            next_url = data.get("next_url")
+            if not next_url:
+                break
+            url = f"{next_url}&apiKey={self._api_key}"
+        return results
 
     # -- historical bars (request_bars, strategy.py's warmup) -------------------
     async def _request_bars(self, request: RequestBars) -> None:
@@ -242,39 +279,22 @@ class PolygonDataClient(LiveMarketDataClient):
 
         start_ms = int(request.start.timestamp() * 1000) if request.start else 0
         end_ms = int(request.end.timestamp() * 1000) if request.end else int(time.time() * 1000)
-
-        # Equities only trade ~6.5h/24h calendar, ~5/7 days - a calendar-time
-        # lookback window (strategy.py's on_start) systematically under-yields
-        # actual trading-hour bars versus what request.limit asks for (audit
-        # finding B1: 6 of 7 watchlist symbols warmed up below the strategy's
-        # own 101-bar floor at the original window). Rather than hand-tune a
-        # multiplier that's really a property of Polygon's actual coverage,
-        # widen the window and retry, bounded, whenever the response falls
-        # short - self-healing regardless of the exact cause, and it logs
-        # loudly if it's still short after trying, instead of silently
-        # accepting too little data the way the original version did.
-        results: list[dict] = []
-        window_ms = end_ms - start_ms
-        for attempt in range(4):
-            results = await self._fetch_aggs(symbol, multiplier, timespan, start_ms, end_ms)
-            if not request.limit or len(results) >= request.limit or attempt == 3:
-                break
-            window_ms *= 3
-            start_ms = end_ms - window_ms
-            self._log.warning(
-                f"{symbol}: warmup returned {len(results)}/{request.limit} bars, "
-                f"widening lookback and retrying (attempt {attempt + 2}/4)"
-            )
+        results = await self._fetch_aggs(
+            symbol, multiplier, timespan, start_ms, end_ms, max_pages=_MAX_WARMUP_PAGES,
+        )
 
         ts_init = self._clock.timestamp_ns()
         bars = [_agg_to_bar(bar_type, agg, ts_init) for agg in results]
         if request.limit and len(bars) > request.limit:
             bars = bars[-request.limit:]
         if request.limit and len(bars) < request.limit:
-            self._log.error(
-                f"{symbol}: warmup delivered only {len(bars)}/{request.limit} bars after "
-                f"widening the lookback window - Polygon's available history for this "
-                f"symbol/timeframe is short of what was requested"
+            # Logged, not raised - a partial warmup still gives the strategy
+            # something to work with; strategy.py's own 101-bar floor is the
+            # actual gate on whether it's enough to compute on.
+            self._log.warning(
+                f"{symbol}: warmup delivered {len(bars)}/{request.limit} bars "
+                f"(hit the {_MAX_WARMUP_PAGES}-page cap) - this account's Polygon "
+                f"history for this symbol/timeframe is short of the full request"
             )
 
         self._handle_bars(bar_type, bars, request.id, request.start, request.end, request.params)

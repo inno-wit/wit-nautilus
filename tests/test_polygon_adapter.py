@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 
 import pytest
 from nautilus_trader.model.data import BarType
@@ -213,3 +214,84 @@ def test_poll_bars_seeds_the_watermark_from_bars_already_in_the_cache():
     refetched = [_agg_to_bar(bar_type, agg_old, ts_init), _agg_to_bar(bar_type, agg_new, ts_init)]
     to_publish = [b for b in refetched if b.ts_event > watermark]
     assert to_publish == []
+
+
+# ── _fetch_aggs pagination (audit finding B1's real root cause) ──────────
+#
+# A first fix attempt widened the warmup request's date range on the theory
+# that equities' ~6.5h/24h trading calendar was starving a calendar-time
+# lookback window - a live redeploy showed delivered bar counts stayed flat
+# regardless of asking 9-27x further back, disproving that theory. The
+# actual cause: Polygon's aggs endpoint paginates via a `next_url` cursor in
+# the response, which nothing here was following, so every call silently
+# returned only its first page no matter how wide the requested range was.
+
+class _NoOpLimiter:
+    async def acquire(self) -> None:
+        return None
+
+
+def test_fetch_aggs_follows_next_url_across_pages(monkeypatch):
+    from wit.adapters.polygon import data as polygon_data
+
+    pages = [
+        {"status": "OK", "results": [{"t": 1}, {"t": 2}], "next_url": "https://api.polygon.io/next1"},
+        {"status": "OK", "results": [{"t": 3}, {"t": 4}], "next_url": "https://api.polygon.io/next2"},
+        {"status": "OK", "results": [{"t": 5}], "next_url": None},
+    ]
+    calls: list[str] = []
+
+    def _fake_get(url):
+        calls.append(url)
+        return pages[len(calls) - 1]
+
+    monkeypatch.setattr(polygon_data, "_polygon_get", _fake_get)
+
+    class _Stub:
+        _api_key = "fake-key"
+        _log = SimpleNamespace(error=lambda *a, **kw: None)
+        _limiter = _NoOpLimiter()
+        _fetch_aggs = polygon_data.PolygonDataClient._fetch_aggs
+
+    results = asyncio.run(_Stub()._fetch_aggs("NVDA", 1, "hour", 0, 1000, max_pages=3))
+    assert [r["t"] for r in results] == [1, 2, 3, 4, 5]
+    assert len(calls) == 3
+    assert calls[1].startswith("https://api.polygon.io/next1")
+    assert "apiKey=fake-key" in calls[1]
+
+
+def test_fetch_aggs_stops_at_max_pages_even_when_more_are_available(monkeypatch):
+    """Bounds the one-time warmup fetch's rate-limit cost (audit finding B1's
+    fix): unboundedly paginating until request.limit is satisfied would cost
+    far more of the shared 4/min budget than warming up 7 symbols can afford
+    at boot."""
+    from wit.adapters.polygon import data as polygon_data
+
+    calls: list[str] = []
+
+    def _fake_get(url):
+        calls.append(url)
+        return {"status": "OK", "results": [{"t": len(calls)}], "next_url": "https://api.polygon.io/more"}
+
+    monkeypatch.setattr(polygon_data, "_polygon_get", _fake_get)
+
+    class _Stub:
+        _api_key = "fake-key"
+        _log = SimpleNamespace(error=lambda *a, **kw: None)
+        _limiter = _NoOpLimiter()
+        _fetch_aggs = polygon_data.PolygonDataClient._fetch_aggs
+
+    results = asyncio.run(_Stub()._fetch_aggs("NVDA", 1, "hour", 0, 1000, max_pages=2))
+    assert len(results) == 2
+    assert len(calls) == 2  # never a 3rd call, even though next_url kept offering one
+
+
+def test_fetch_aggs_defaults_to_a_single_page_for_live_polling():
+    """_poll_bars/_poll_quotes_standalone only ever want the newest few bars
+    and must not inherit warmup's multi-page cost."""
+    import inspect
+
+    from wit.adapters.polygon.data import PolygonDataClient
+
+    sig = inspect.signature(PolygonDataClient._fetch_aggs)
+    assert sig.parameters["max_pages"].default == 1
