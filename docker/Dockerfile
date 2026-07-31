@@ -9,7 +9,13 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY wit ./wit
 
-RUN pip install --no-cache-dir ".[ib]"
+# -e (editable): wit/config.py's PROJECT_ROOT is computed from __file__'s parent.parent -
+# a non-editable install copies wit/ into site-packages, which resolves PROJECT_ROOT to
+# site-packages instead of /app, breaking journal_path/decision_cache_path/kill_switch_file/
+# dream state_path (none of which then land in the ../data:/app/data bind mount) and getting
+# a PermissionError on boot besides, since the non-root `wit` user can't write site-packages.
+# Editable keeps __file__ resolving under /app, where the source actually is.
+RUN pip install --no-cache-dir -e ".[ib]"
 
 # Non-root in the container too (defense in depth, separate from the VPS-level non-root
 # docker-group user docs/BUILD_PLAN.md's Phase N8 section asks for on the host) — this
