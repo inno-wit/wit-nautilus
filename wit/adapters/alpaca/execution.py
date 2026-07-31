@@ -186,7 +186,10 @@ class AlpacaExecutionClient(LiveExecutionClient):
         # here too: whichever client connects first does the real work, the
         # other's call is a no-op (`InstrumentProvider.initialize` short-circuits
         # once `_loaded` is True), and this client must not assume connection order.
-        await self.instrument_provider.initialize()
+        # `_instrument_provider`, not `instrument_provider` (no public alias
+        # exists on LiveExecutionClient - confirmed live against a real boot
+        # after this attribute name was initially guessed wrong).
+        await self._instrument_provider.initialize()
 
         account = await asyncio.to_thread(self._client.get_account)
         self._set_account_id(AccountId(f"ALPACA-{account.account_number}"))

@@ -162,8 +162,11 @@ class PolygonDataClient(LiveMarketDataClient):
         self._quote_tasks: dict = {}
 
     async def _connect(self) -> None:
-        await self.instrument_provider.initialize()
-        for instrument in self.instrument_provider.list_all():
+        # `_instrument_provider`, not `instrument_provider` (no public alias
+        # exists on LiveMarketDataClient - confirmed live against a real boot
+        # after this attribute name was initially guessed wrong).
+        await self._instrument_provider.initialize()
+        for instrument in self._instrument_provider.list_all():
             self._handle_data(instrument)
 
     async def _disconnect(self) -> None:
