@@ -23,16 +23,13 @@
     },
     "markov": {
       "bars_used": 600,
-      "bear_prob": 0.9966,
-      "bull_prob": 0.0017,
-      "confidence": 0.977,
+      "bear_prob": 0.9355,
+      "bull_prob": 0.0323,
+      "confidence": 0.7416,
       "detail": {
         "horizon": 1,
-        "regime_occupancy": {
-          "Bear": 1.0
-        },
-        "threshold": "0.75-sigma",
-        "transition_matrix": {
+        "label_verification": [],
+        "matrix_overlapping_legacy": {
           "Bear": {
             "Bear": 0.997,
             "Bull": 0.002,
@@ -49,12 +46,63 @@
             "Sideways": 0.333
           }
         },
+        "matrix_stride_sampled_true": {
+          "Bear": {
+            "Bear": 0.935,
+            "Bull": 0.032,
+            "Sideways": 0.032
+          },
+          "Bull": {
+            "Bear": 0.333,
+            "Bull": 0.333,
+            "Sideways": 0.333
+          },
+          "Sideways": {
+            "Bear": 0.333,
+            "Bull": 0.333,
+            "Sideways": 0.333
+          }
+        },
+        "mode": "filter",
+        "n_transitions_overlapping": 579,
+        "n_transitions_stride": 28,
+        "regime_occupancy": {
+          "Bear": 1.0
+        },
+        "stickiness_overlapping_legacy": {
+          "Bear": 0.9966,
+          "Bull": 0.3333,
+          "Sideways": 0.3333
+        },
+        "stickiness_stride_sampled_true": {
+          "Bear": 0.9355,
+          "Bull": 0.3333,
+          "Sideways": 0.3333
+        },
+        "threshold": "0.75-sigma",
+        "transition_matrix": {
+          "Bear": {
+            "Bear": 0.935,
+            "Bull": 0.032,
+            "Sideways": 0.032
+          },
+          "Bull": {
+            "Bear": 0.333,
+            "Bull": 0.333,
+            "Sideways": 0.333
+          },
+          "Sideways": {
+            "Bear": 0.333,
+            "Bull": 0.333,
+            "Sideways": 0.333
+          }
+        },
         "window": 20
       },
       "direction": "BEAR",
       "regime": "Bear",
-      "sideways_prob": 0.0017,
-      "signal": -0.9948,
+      "sideways_prob": 0.0323,
+      "signal": -0.9032,
       "symbol": "EURUSD"
     },
     "technicals": {
@@ -98,17 +146,13 @@
     },
     "markov": {
       "bars_used": 600,
-      "bear_prob": 0.0017,
-      "bull_prob": 0.9913,
-      "confidence": 0.9505,
+      "bear_prob": 0.0323,
+      "bull_prob": 0.9355,
+      "confidence": 0.7416,
       "detail": {
         "horizon": 1,
-        "regime_occupancy": {
-          "Bull": 0.986,
-          "Sideways": 0.014
-        },
-        "threshold": "0.75-sigma",
-        "transition_matrix": {
+        "label_verification": [],
+        "matrix_overlapping_legacy": {
           "Bear": {
             "Bear": 0.333,
             "Bull": 0.333,
@@ -125,12 +169,64 @@
             "Sideways": 0.545
           }
         },
+        "matrix_stride_sampled_true": {
+          "Bear": {
+            "Bear": 0.333,
+            "Bull": 0.333,
+            "Sideways": 0.333
+          },
+          "Bull": {
+            "Bear": 0.032,
+            "Bull": 0.935,
+            "Sideways": 0.032
+          },
+          "Sideways": {
+            "Bear": 0.333,
+            "Bull": 0.333,
+            "Sideways": 0.333
+          }
+        },
+        "mode": "filter",
+        "n_transitions_overlapping": 579,
+        "n_transitions_stride": 28,
+        "regime_occupancy": {
+          "Bull": 0.986,
+          "Sideways": 0.014
+        },
+        "stickiness_overlapping_legacy": {
+          "Bear": 0.3333,
+          "Bull": 0.9913,
+          "Sideways": 0.5455
+        },
+        "stickiness_stride_sampled_true": {
+          "Bear": 0.3333,
+          "Bull": 0.9355,
+          "Sideways": 0.3333
+        },
+        "threshold": "0.75-sigma",
+        "transition_matrix": {
+          "Bear": {
+            "Bear": 0.333,
+            "Bull": 0.333,
+            "Sideways": 0.333
+          },
+          "Bull": {
+            "Bear": 0.032,
+            "Bull": 0.935,
+            "Sideways": 0.032
+          },
+          "Sideways": {
+            "Bear": 0.333,
+            "Bull": 0.333,
+            "Sideways": 0.333
+          }
+        },
         "window": 20
       },
       "direction": "BULL",
       "regime": "Bull",
-      "sideways_prob": 0.007,
-      "signal": 0.9895,
+      "sideways_prob": 0.0323,
+      "signal": 0.9032,
       "symbol": "EURUSD"
     },
     "technicals": {
@@ -174,18 +270,13 @@
     },
     "markov": {
       "bars_used": 600,
-      "bear_prob": 0.0217,
-      "bull_prob": 0.7826,
-      "confidence": 0.4591,
+      "bear_prob": 0.3333,
+      "bull_prob": 0.1667,
+      "confidence": 0.0794,
       "detail": {
         "horizon": 1,
-        "regime_occupancy": {
-          "Bear": 0.443,
-          "Bull": 0.076,
-          "Sideways": 0.481
-        },
-        "threshold": "0.75-sigma",
-        "transition_matrix": {
+        "label_verification": [],
+        "matrix_overlapping_legacy": {
           "Bear": {
             "Bear": 0.9,
             "Bull": 0.004,
@@ -202,12 +293,65 @@
             "Sideways": 0.879
           }
         },
+        "matrix_stride_sampled_true": {
+          "Bear": {
+            "Bear": 0.562,
+            "Bull": 0.125,
+            "Sideways": 0.312
+          },
+          "Bull": {
+            "Bear": 0.333,
+            "Bull": 0.167,
+            "Sideways": 0.5
+          },
+          "Sideways": {
+            "Bear": 0.267,
+            "Bull": 0.2,
+            "Sideways": 0.533
+          }
+        },
+        "mode": "filter",
+        "n_transitions_overlapping": 579,
+        "n_transitions_stride": 28,
+        "regime_occupancy": {
+          "Bear": 0.443,
+          "Bull": 0.076,
+          "Sideways": 0.481
+        },
+        "stickiness_overlapping_legacy": {
+          "Bear": 0.9,
+          "Bull": 0.7826,
+          "Sideways": 0.8794
+        },
+        "stickiness_stride_sampled_true": {
+          "Bear": 0.5625,
+          "Bull": 0.1667,
+          "Sideways": 0.5333
+        },
+        "threshold": "0.75-sigma",
+        "transition_matrix": {
+          "Bear": {
+            "Bear": 0.562,
+            "Bull": 0.125,
+            "Sideways": 0.312
+          },
+          "Bull": {
+            "Bear": 0.333,
+            "Bull": 0.167,
+            "Sideways": 0.5
+          },
+          "Sideways": {
+            "Bear": 0.267,
+            "Bull": 0.2,
+            "Sideways": 0.533
+          }
+        },
         "window": 20
       },
-      "direction": "BULL",
+      "direction": "BEAR",
       "regime": "Bull",
-      "sideways_prob": 0.1957,
-      "signal": 0.7609,
+      "sideways_prob": 0.5,
+      "signal": -0.1667,
       "symbol": "EURUSD"
     },
     "technicals": {
