@@ -15,23 +15,23 @@ from wit.desks.technicals import Technicals
 
 
 def _tech(**over) -> Technicals:
-    base = dict(symbol="EURUSD", last_close=1.10, ema_fast=1.101, ema_slow=1.10,
-                trend="flat", rsi=50.0, atr=0.001, atr_pct=0.001,
-                range_high=1.12, range_low=1.08, range_position=0.5,
-                ret_20=0.0, ret_100=0.0)
+    base = {"symbol": "EURUSD", "last_close": 1.10, "ema_fast": 1.101, "ema_slow": 1.10,
+                "trend": "flat", "rsi": 50.0, "atr": 0.001, "atr_pct": 0.001,
+                "range_high": 1.12, "range_low": 1.08, "range_position": 0.5,
+                "ret_20": 0.0, "ret_100": 0.0}
     return Technicals(**{**base, **over})
 
 
 def _mk(**over) -> MarkovSignal:
-    base = dict(symbol="EURUSD", regime="Sideways", direction="NEUTRAL", signal=0.0,
-                confidence=0.5, bull_prob=0.33, bear_prob=0.33, sideways_prob=0.34,
-                bars_used=750)
+    base = {"symbol": "EURUSD", "regime": "Sideways", "direction": "NEUTRAL", "signal": 0.0,
+                "confidence": 0.5, "bull_prob": 0.33, "bear_prob": 0.33, "sideways_prob": 0.34,
+                "bars_used": 750}
     return MarkovSignal(**{**base, **over})
 
 
 def _gk(**over) -> GarchSignal:
-    base = dict(symbol="EURUSD", vol_forecast=0.1, vol_regime="normal",
-                size_multiplier=1.0, realized_vol=0.1, vol_percentile=0.5, bars_used=750)
+    base = {"symbol": "EURUSD", "vol_forecast": 0.1, "vol_regime": "normal",
+                "size_multiplier": 1.0, "realized_vol": 0.1, "vol_percentile": 0.5, "bars_used": 750}
     return GarchSignal(**{**base, **over})
 
 

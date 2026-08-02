@@ -63,7 +63,7 @@ class DecisionProvider(Protocol):
 _COMMITTEE_MODES = ("llm", "rules")
 
 
-def build_committee_provider(cfg: Config = CONFIG) -> "LiveCommitteeProvider | RulePolicyProvider":
+def build_committee_provider(cfg: Config = CONFIG) -> LiveCommitteeProvider | RulePolicyProvider:
     """Construct the committee ``cfg.committee_mode`` selects (mirrors the MT5
     build's ``Orchestrator.committee`` property). Imports are deferred so a
     ``rules``-mode run never needs ``anthropic`` importable, or any LLM/
